@@ -90,6 +90,41 @@ notrace tempo tail --query '{resource.service.name="frontend"}' --interval 3s
 notrace tempo tail --query '{status=error}' --output json | jq .rootTraceName
 ```
 
+## Offline analysis
+
+Capture traces to a file and query them with `lab/query.py`, a DuckDB-backed helper that filters by span and resource attributes.
+
+**Capture:**
+
+```bash
+./notrace tempo tail -o json --details >> notrace.json
+# or a one-shot search
+./notrace tempo search --start 1h -o json --details > notrace.json
+```
+
+**Query:**
+
+```bash
+# all traces (sorted by duration desc)
+python3 lab/query.py -f notrace.json
+
+# filter by span attribute
+python3 lab/query.py -f notrace.json --span-attr hola.code=M1234
+
+# filter by resource attribute
+python3 lab/query.py -f notrace.json --resource-attr service.name=frontend
+
+# combine (ANDed)
+python3 lab/query.py -f notrace.json \
+  --resource-attr service.name=frontend \
+  --span-attr http.method=GET
+
+# inspect the generated SQL
+python3 lab/query.py -f notrace.json --span-attr hola.code=M1234 --sql
+```
+
+Requires `pip install duckdb`. The `--details` flag must be used when capturing, otherwise span and resource attributes are not included in the output.
+
 ## Configuration
 
 Priority order: `--flag` > environment variable > `~/.config/notrace/notrace.yaml`
@@ -99,6 +134,7 @@ Priority order: `--flag` > environment variable > `~/.config/notrace/notrace.yam
 | `--tempo-url` | `NOTRACE_TEMPO_URL`  | `tempo.url`  | Tempo base URL                       |
 | `--token`     | `NOTRACE_TOKEN`      | `tempo.token`| Bearer token (Grafana Cloud)         |
 | `--org-id`    | `NOTRACE_ORG_ID`     | `tempo.org_id` | Org ID for multi-tenant deployments|
+| `--timeout`   | `NOTRACE_TIMEOUT`    | `tempo.timeout`| HTTP request timeout (default 10s) |
 
 Config file example (`~/.config/notrace/config.yaml`):
 
@@ -142,6 +178,7 @@ notrace/
 ├── lab/
 │   ├── docker-compose.yaml
 │   ├── config/             # tempo.yaml, prometheus.yaml
-│   └── traffic-gen/        # synthetic load generator
+│   ├── traffic-gen/        # synthetic load generator
+│   └── query.py            # offline DuckDB query helper
 └── Makefile
 ```
