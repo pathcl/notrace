@@ -51,43 +51,57 @@ The traffic generator runs three goroutines simulating `frontend`, `checkout`, a
 
 ## Commands
 
+### Global flags
+
+Available on every subcommand:
+
+| Flag | Short | Env var | Default | Description |
+|------|-------|---------|---------|-------------|
+| `--tempo-url` | | `NOTRACE_TEMPO_URL` | | Tempo base URL |
+| `--token` | | `NOTRACE_TOKEN` | | Bearer token (Grafana Cloud) |
+| `--org-id` | | `NOTRACE_ORG_ID` | | Org ID for multi-tenant deployments |
+| `--timeout` | | `NOTRACE_TIMEOUT` | `10s` | HTTP request timeout |
+| `--verbose` | `-v` | | `false` | Log each HTTP request and response to stderr |
+
 ### `notrace tempo search`
 
-```
-Flags:
-  --start string     Start time: relative (1h, 30m, 2d, 1d12h) or RFC3339 (default "1h")
-  --end string       End time: relative or RFC3339 (default "now")
-  -q, --query string TraceQL query (default "{}")
-  --limit int        Max traces to return (default 20)
-  -o, --output string  table | json (default "table")
-```
+One-shot query for traces over a time range.
 
-Examples:
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--start` | | `1h` | Start time: relative (`1h`, `30m`, `2d`, `1d12h`) or RFC3339 |
+| `--end` | | `now` | End time: relative or RFC3339 |
+| `--query` | `-q` | `{}` | TraceQL expression |
+| `--limit` | | `20` | Max traces to return |
+| `--output` | `-o` | `table` | Output format: `table`, `json` |
+| `--details` | `-d` | `false` | Fetch and display resource + span attributes per trace |
 
 ```bash
 notrace tempo search --start 2h
-notrace tempo search --start 30m --query '{resource.service.name="checkout"}'
+notrace tempo search --start 30m -q '{resource.service.name="checkout"}'
 notrace tempo search --start 2026-09-08T10:00:00Z --end 2026-09-08T11:00:00Z
-notrace tempo search --start 1h --query '{status=error}' --output json | jq .traceID
+notrace tempo search --start 1h -q '{status=error}' --limit 100 -o json | jq .traceID
+notrace tempo search --start 1h --details -v
 ```
 
 ### `notrace tempo tail`
 
-Polls Tempo every `--interval` seconds with a 30-second sliding window and prints traces as they appear. Deduplicates by traceID across polls.
+Polls Tempo on a sliding 30-second window, deduplicates by traceID, and prints new traces as they arrive. Each poll logs a status line to stderr (`polled=N new=N seen=N`). Press Ctrl-C to stop.
 
-```
-Flags:
-  -q, --query string   TraceQL query (default "{}")
-  --interval duration  Poll interval (default 5s)
-  -o, --output string  table | json (default "table")
-```
-
-Examples:
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--query` | `-q` | `{}` | TraceQL expression |
+| `--interval` | | `5s` | Poll interval |
+| `--limit` | | `100` | Max traces fetched per poll |
+| `--output` | `-o` | `table` | Output format: `table`, `json` |
+| `--details` | `-d` | `false` | Fetch and display resource + span attributes per trace |
 
 ```bash
 notrace tempo tail
-notrace tempo tail --query '{resource.service.name="frontend"}' --interval 3s
-notrace tempo tail --query '{status=error}' --output json | jq .rootTraceName
+notrace tempo tail -q '{resource.service.name="frontend"}' --interval 3s
+notrace tempo tail -q '{status=error}' -o json | jq .rootTraceName
+notrace tempo tail -o json --details >> notrace.json
+notrace tempo tail --limit 500 -v
 ```
 
 ## Offline analysis
@@ -127,14 +141,9 @@ Requires `pip install duckdb`. The `--details` flag must be used when capturing,
 
 ## Configuration
 
-Priority order: `--flag` > environment variable > `~/.config/notrace/notrace.yaml`
+Priority order: `--flag` > environment variable > config file.
 
-| Flag          | Env var              | Config key   | Description                          |
-|---------------|----------------------|--------------|--------------------------------------|
-| `--tempo-url` | `NOTRACE_TEMPO_URL`  | `tempo.url`  | Tempo base URL                       |
-| `--token`     | `NOTRACE_TOKEN`      | `tempo.token`| Bearer token (Grafana Cloud)         |
-| `--org-id`    | `NOTRACE_ORG_ID`     | `tempo.org_id` | Org ID for multi-tenant deployments|
-| `--timeout`   | `NOTRACE_TIMEOUT`    | `tempo.timeout`| HTTP request timeout (default 10s) |
+Config file is loaded from `~/.config/notrace/config.yaml` or `./config.yaml`:
 
 Config file example (`~/.config/notrace/config.yaml`):
 
