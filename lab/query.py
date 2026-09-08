@@ -16,6 +16,7 @@ Requires:
 """
 
 import argparse
+import json
 import sys
 
 try:
@@ -34,6 +35,16 @@ def parse_kv(values: list[str]) -> list[tuple[str, str]]:
         k, _, val = v.partition("=")
         result.append((k.strip(), val.strip()))
     return result
+
+
+def build_detail_query(file: str, trace_ids: list[str]) -> str:
+    ids = ", ".join(repr(t) for t in trace_ids)
+    return f"""
+SELECT traceID, detail
+FROM read_json({file!r}, format = 'newline_delimited', auto_detect = true)
+WHERE traceID IN ({ids})
+ORDER BY durationMs DESC
+"""
 
 
 def build_query(file: str, span_attrs: list[tuple[str, str]], resource_attrs: list[tuple[str, str]]) -> str:
@@ -106,6 +117,7 @@ def main() -> None:
     parser.add_argument("--file", "-f", required=True, help="NDJSON file produced by notrace (--details --output json)")
     parser.add_argument("--span-attr", "-s", metavar="key=value", action="append", default=[], help="Filter by span attribute (repeatable, ANDed)")
     parser.add_argument("--resource-attr", "-r", metavar="key=value", action="append", default=[], help="Filter by resource attribute (repeatable, ANDed)")
+    parser.add_argument("--detail", "-d", action="store_true", help="Pretty-print the full OTLP detail for each matched trace")
     parser.add_argument("--sql", action="store_true", help="Print the generated SQL instead of running it")
     args = parser.parse_args()
 
@@ -140,6 +152,25 @@ def main() -> None:
         print("  ".join(str(v).ljust(col_widths[i]) for i, v in enumerate(row)))
 
     print(f"\n{len(rows)} trace(s) matched", file=sys.stderr)
+
+    if not args.detail:
+        return
+
+    trace_ids = [row[0] for row in rows]
+    detail_sql = build_detail_query(args.file, trace_ids)
+    try:
+        detail_rows = con.execute(detail_sql).fetchall()
+    except duckdb.Error as e:
+        print(f"error fetching detail: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print()
+    for trace_id, detail in detail_rows:
+        print(f"{'─' * 72}")
+        print(f"trace: {trace_id}")
+        print(f"{'─' * 72}")
+        print(json.dumps(detail, indent=2))
+        print()
 
 
 if __name__ == "__main__":
