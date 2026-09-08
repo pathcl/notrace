@@ -53,15 +53,16 @@ func newTempoTailCmd() *cobra.Command {
 				if !details {
 					return render.Traces(os.Stdout, traces, output)
 				}
-				traceDetails := make([]*tempo.TraceDetail, len(traces))
-				for i, tr := range traces {
+				for _, tr := range traces {
 					d, err := client.GetTrace(ctx, tr.TraceID)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "warn: get trace %s: %v\n", tr.TraceID, err)
 					}
-					traceDetails[i] = d
+					if err := render.TracesDetailed(os.Stdout, []tempo.TraceSearchMetadata{tr}, []*tempo.TraceDetail{d}, output); err != nil {
+						return err
+					}
 				}
-				return render.TracesDetailed(os.Stdout, traces, traceDetails, output)
+				return nil
 			})
 		},
 	}
