@@ -198,6 +198,23 @@ def import_ndjson(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _attr_condition(scope: str, key: str, val: str) -> tuple[str, list]:
+    try:
+        int_val = int(val)
+        clause = (
+            f"EXISTS (SELECT 1 FROM attributes "
+            f"WHERE trace_id = t.trace_id AND scope = '{scope}' AND key = ? "
+            f"AND (value_str = ? OR value_int = ?))"
+        )
+        return clause, [key, val, int_val]
+    except ValueError:
+        clause = (
+            f"EXISTS (SELECT 1 FROM attributes "
+            f"WHERE trace_id = t.trace_id AND scope = '{scope}' AND key = ? AND value_str = ?)"
+        )
+        return clause, [key, val]
+
+
 def query_db(span_attrs: list, resource_attrs: list) -> tuple[str, list]:
     sql = """
 SELECT DISTINCT t.trace_id, t.service_name, t.root_span_name, t.duration_ms
@@ -206,11 +223,13 @@ WHERE 1=1
 """
     params: list = []
     for key, val in span_attrs:
-        sql += "  AND EXISTS (SELECT 1 FROM attributes WHERE trace_id = t.trace_id AND scope = 'span' AND key = ? AND value_str = ?)\n"
-        params += [key, val]
+        clause, p = _attr_condition("span", key, val)
+        sql += f"  AND {clause}\n"
+        params += p
     for key, val in resource_attrs:
-        sql += "  AND EXISTS (SELECT 1 FROM attributes WHERE trace_id = t.trace_id AND scope = 'resource' AND key = ? AND value_str = ?)\n"
-        params += [key, val]
+        clause, p = _attr_condition("resource", key, val)
+        sql += f"  AND {clause}\n"
+        params += p
     sql += "ORDER BY t.duration_ms DESC"
     return sql, params
 
