@@ -37,6 +37,50 @@ def parse_kv(values: list[str]) -> list[tuple[str, str]]:
     return result
 
 
+def build_values_query(file: str, key: str, attr_type: str) -> str:
+    # attr_type: "span" queries span_attrs CTE, "resource" queries res_attrs CTE
+    cte = f"""
+WITH
+batches AS (
+    SELECT UNNEST(detail.batches) AS b
+    FROM read_json({file!r}, format = 'newline_delimited', auto_detect = true)
+),
+scope_spans AS (
+    SELECT b.resource.attributes AS resource_attrs,
+           UNNEST(b.scopeSpans) AS ss
+    FROM batches
+),
+spans AS (
+    SELECT resource_attrs,
+           UNNEST(ss.spans) AS sp
+    FROM scope_spans
+),
+span_attrs AS (
+    SELECT resource_attrs,
+           UNNEST(sp.attributes) AS attr
+    FROM spans
+),
+res_attrs AS (
+    SELECT UNNEST(resource_attrs) AS ra
+    FROM span_attrs
+)
+"""
+    if attr_type == "resource":
+        return cte + f"""
+SELECT DISTINCT ra.value.stringValue AS value
+FROM res_attrs
+WHERE ra.key = {key!r} AND ra.value.stringValue IS NOT NULL
+ORDER BY 1
+"""
+    else:
+        return cte + f"""
+SELECT DISTINCT attr.value.stringValue AS value
+FROM span_attrs
+WHERE attr.key = {key!r} AND attr.value.stringValue IS NOT NULL
+ORDER BY 1
+"""
+
+
 def build_detail_query(file: str, trace_ids: list[str]) -> str:
     ids = ", ".join(repr(t) for t in trace_ids)
     return f"""
@@ -118,8 +162,33 @@ def main() -> None:
     parser.add_argument("--span-attr", "-s", metavar="key=value", action="append", default=[], help="Filter by span attribute (repeatable, ANDed)")
     parser.add_argument("--resource-attr", "-r", metavar="key=value", action="append", default=[], help="Filter by resource attribute (repeatable, ANDed)")
     parser.add_argument("--detail", "-d", action="store_true", help="Pretty-print the full OTLP detail for each matched trace")
+    parser.add_argument("--list-resource-attr", metavar="KEY", help="List unique values for a resource attribute key")
+    parser.add_argument("--list-span-attr", metavar="KEY", help="List unique values for a span attribute key")
     parser.add_argument("--sql", action="store_true", help="Print the generated SQL instead of running it")
     args = parser.parse_args()
+
+    con = duckdb.connect()
+
+    # --list-* flags: enumerate unique values and exit
+    for key, attr_type in [(args.list_resource_attr, "resource"), (args.list_span_attr, "span")]:
+        if not key:
+            continue
+        sql = build_values_query(args.file, key, attr_type)
+        if args.sql:
+            print(sql)
+            return
+        try:
+            rows = con.execute(sql).fetchall()
+        except duckdb.Error as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not rows:
+            print(f"no values found for {key!r}", file=sys.stderr)
+            return
+        print(key)
+        for (val,) in rows:
+            print(f"  {val}")
+        return
 
     span_attrs = parse_kv(args.span_attr)
     resource_attrs = parse_kv(args.resource_attr)
@@ -130,7 +199,6 @@ def main() -> None:
         print(sql)
         return
 
-    con = duckdb.connect()
     try:
         rel = con.execute(sql)
         rows = rel.fetchall()
