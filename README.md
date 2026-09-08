@@ -116,7 +116,18 @@ Capture traces to a file and query them with `lab/query.py`, a DuckDB-backed hel
 ./notrace tempo search --start 1h -o json --details > notrace.json
 ```
 
-**Query:**
+**Discover attribute keys and values:**
+
+```bash
+# unique values for a resource attribute key
+python3 lab/query.py -f notrace.json --list-resource-attr service.name
+
+# unique values for a span attribute key
+python3 lab/query.py -f notrace.json --list-span-attr http.method
+python3 lab/query.py -f notrace.json --list-span-attr http.status_code
+```
+
+**Filter traces:**
 
 ```bash
 # all traces (sorted by duration desc)
@@ -132,6 +143,9 @@ python3 lab/query.py -f notrace.json --resource-attr service.name=frontend
 python3 lab/query.py -f notrace.json \
   --resource-attr service.name=frontend \
   --span-attr http.method=GET
+
+# show full OTLP detail for each matched trace
+python3 lab/query.py -f notrace.json --span-attr hola.code=M1234 --detail
 
 # inspect the generated SQL
 python3 lab/query.py -f notrace.json --span-attr hola.code=M1234 --sql
