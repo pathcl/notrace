@@ -44,7 +44,7 @@ WITH
 batches AS (
     SELECT traceID, rootServiceName, rootTraceName, durationMs,
            UNNEST(detail.batches) AS b
-    FROM read_ndjson({file!r}, ignore_errors := true)
+    FROM read_json({file!r}, format = 'newline_delimited', auto_detect = true)
 ),
 scope_spans AS (
     SELECT traceID, rootServiceName, rootTraceName, durationMs,
