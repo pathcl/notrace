@@ -25,7 +25,7 @@ func TestTailerDedup(t *testing.T) {
 		Interval: time.Second,
 		Lookback: 30 * time.Second,
 	})
-	seen := make(map[string]struct{})
+	seen := make(map[string]time.Time)
 	var received []TraceSearchMetadata
 
 	collect := func(traces []TraceSearchMetadata) error {
@@ -63,7 +63,7 @@ func TestTailerNewTracesDelivered(t *testing.T) {
 		Interval: time.Second,
 		Lookback: 30 * time.Second,
 	})
-	seen := make(map[string]struct{})
+	seen := make(map[string]time.Time)
 	var received []TraceSearchMetadata
 
 	collect := func(traces []TraceSearchMetadata) error {
@@ -77,6 +77,46 @@ func TestTailerNewTracesDelivered(t *testing.T) {
 	// Each poll returns a unique traceID, so both should be delivered.
 	if len(received) != 2 {
 		t.Errorf("got %d traces, want 2", len(received))
+	}
+}
+
+func TestTailerEvictsExpiredEntries(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(SearchResponse{
+			Traces: []TraceSearchMetadata{
+				{TraceID: "abc123"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	lookback := 30 * time.Second
+	tailer := NewTailer(NewClient(srv.URL, "", "", 5*time.Second), TailOptions{
+		Query:    "{}",
+		Interval: time.Second,
+		Lookback: lookback,
+	})
+
+	seen := make(map[string]time.Time)
+	var received []TraceSearchMetadata
+	collect := func(traces []TraceSearchMetadata) error {
+		received = append(received, traces...)
+		return nil
+	}
+
+	// First poll — trace is new, delivered.
+	_ = tailer.poll(context.Background(), seen, collect)
+	if len(received) != 1 {
+		t.Fatalf("first poll: got %d traces, want 1", len(received))
+	}
+
+	// Backdate the seen entry so it falls outside the lookback window.
+	seen["abc123"] = time.Now().Add(-lookback - time.Second)
+
+	// Second poll — entry is evicted, trace is delivered again.
+	_ = tailer.poll(context.Background(), seen, collect)
+	if len(received) != 2 {
+		t.Errorf("after eviction: got %d traces, want 2", len(received))
 	}
 }
 
@@ -97,7 +137,7 @@ func TestTailerSlidingWindow(t *testing.T) {
 	})
 
 	before := time.Now().Unix()
-	_ = tailer.poll(context.Background(), make(map[string]struct{}), func([]TraceSearchMetadata) error { return nil })
+	_ = tailer.poll(context.Background(), make(map[string]time.Time), func([]TraceSearchMetadata) error { return nil })
 	after := time.Now().Unix()
 
 	if capturedEnd < before || capturedEnd > after+1 {
