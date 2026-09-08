@@ -2,14 +2,16 @@
 """
 notrace query helper — offline analysis of notrace NDJSON output using DuckDB.
 
-Usage:
-    python3 lab/query.py --file notrace.json
-    python3 lab/query.py --file notrace.json --resource-attr service.name=frontend
-    python3 lab/query.py --file notrace.json --span-attr hola.code=M1234
-    python3 lab/query.py --file notrace.json \
-        --resource-attr service.name=frontend \
-        --span-attr hola.code=M1234 \
-        --span-attr http.method=GET
+Usage (file mode — one-shot, re-parses NDJSON each query):
+    python3 lab/query.py -f notrace.json
+    python3 lab/query.py -f notrace.json --resource-attr service.name=frontend
+    python3 lab/query.py -f notrace.json --span-attr http.method=GET
+
+Usage (DB mode — persistent, indexed, faster on large captures):
+    python3 lab/query.py --db notrace.db --import notrace.json
+    python3 lab/query.py --db notrace.db --schema
+    python3 lab/query.py --db notrace.db --resource-attr service.name=frontend
+    python3 lab/query.py --db notrace.db --span-attr http.status_code=500
 
 Requires:
     pip install duckdb
@@ -18,6 +20,7 @@ Requires:
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 
 try:
     import duckdb
@@ -25,6 +28,10 @@ except ImportError:
     print("error: duckdb not installed — run: pip install duckdb", file=sys.stderr)
     sys.exit(1)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def parse_kv(values: list[str]) -> list[tuple[str, str]]:
     result = []
@@ -37,8 +44,240 @@ def parse_kv(values: list[str]) -> list[tuple[str, str]]:
     return result
 
 
+def show_sql(sql: str, params: list | None = None) -> None:
+    if params:
+        result = sql
+        for p in params:
+            result = result.replace("?", repr(p), 1)
+        print(result)
+    else:
+        print(sql)
+
+
+def print_table(rows: list, cols: list[str]) -> None:
+    col_widths = [
+        max(len(c), max((len(str(r[i])) for r in rows), default=0))
+        for i, c in enumerate(cols)
+    ]
+    print("  ".join(c.upper().ljust(col_widths[i]) for i, c in enumerate(cols)))
+    print("  ".join("-" * w for w in col_widths))
+    for row in rows:
+        print("  ".join(str(v).ljust(col_widths[i]) for i, v in enumerate(row)))
+
+
+def print_detail_blobs(detail_rows: list) -> None:
+    print()
+    for trace_id, detail in detail_rows:
+        print(f"{'─' * 72}")
+        print(f"trace: {trace_id}")
+        print(f"{'─' * 72}")
+        if isinstance(detail, str):
+            detail = json.loads(detail)
+        print(json.dumps(detail, indent=2))
+        print()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DB mode — schema, import, queries
+# ──────────────────────────────────────────────────────────────────────────────
+
+def init_db(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS traces (
+            trace_id        VARCHAR PRIMARY KEY,
+            service_name    VARCHAR,
+            root_span_name  VARCHAR,
+            duration_ms     INTEGER,
+            started_at      TIMESTAMPTZ,
+            raw_detail      JSON
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS attributes (
+            trace_id    VARCHAR,
+            span_name   VARCHAR,
+            scope       VARCHAR,
+            key         VARCHAR,
+            value_str   VARCHAR,
+            value_int   BIGINT,
+            value_bool  BOOLEAN
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_attr_key_val ON attributes (key, value_str)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_attr_trace   ON attributes (trace_id)")
+
+
+def _extract_attr(attr: dict) -> tuple:
+    key = attr.get("key", "")
+    val = attr.get("value", {})
+    str_val = val.get("stringValue")
+    int_val = val.get("intValue")
+    bool_val = val.get("boolValue")
+    if int_val is not None:
+        try:
+            int_val = int(int_val)
+        except (TypeError, ValueError):
+            int_val = None
+    return key, str_val, int_val, bool_val
+
+
+def import_ndjson(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
+    imported = 0
+    skipped = 0
+    errors = 0
+
+    with open(file_path) as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"warn: line {line_num}: {e}", file=sys.stderr)
+                errors += 1
+                continue
+
+            trace_id = obj.get("traceID", "")
+            if not trace_id:
+                continue
+
+            existing = con.execute(
+                "SELECT 1 FROM traces WHERE trace_id = ?", [trace_id]
+            ).fetchone()
+            if existing:
+                skipped += 1
+                continue
+
+            service_name = obj.get("rootServiceName", "")
+            root_span_name = obj.get("rootTraceName", "")
+            duration_ms = obj.get("durationMs", 0)
+            start_ns_raw = obj.get("startTimeUnixNano", "0") or "0"
+            detail = obj.get("detail")
+
+            try:
+                ns = int(start_ns_raw)
+                started_at = (
+                    datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).isoformat()
+                    if ns > 0 else None
+                )
+            except (ValueError, OSError):
+                started_at = None
+
+            con.execute(
+                "INSERT INTO traces VALUES (?, ?, ?, ?, ?, ?)",
+                [trace_id, service_name, root_span_name, duration_ms, started_at, json.dumps(detail)],
+            )
+
+            if detail:
+                attr_rows = []
+                for batch in detail.get("batches", []):
+                    for attr in batch.get("resource", {}).get("attributes", []):
+                        key, str_val, int_val, bool_val = _extract_attr(attr)
+                        attr_rows.append((trace_id, None, "resource", key, str_val, int_val, bool_val))
+
+                    for scope_span in batch.get("scopeSpans", []):
+                        for span in scope_span.get("spans", []):
+                            span_name = span.get("name", "")
+                            for attr in span.get("attributes", []):
+                                key, str_val, int_val, bool_val = _extract_attr(attr)
+                                attr_rows.append((trace_id, span_name, "span", key, str_val, int_val, bool_val))
+
+                if attr_rows:
+                    con.executemany(
+                        "INSERT INTO attributes VALUES (?, ?, ?, ?, ?, ?, ?)", attr_rows
+                    )
+
+            imported += 1
+
+    msg = f"imported {imported} trace(s)"
+    if skipped:
+        msg += f", skipped {skipped} duplicate(s)"
+    if errors:
+        msg += f", {errors} parse error(s)"
+    print(msg, file=sys.stderr)
+
+
+def query_db(span_attrs: list, resource_attrs: list) -> tuple[str, list]:
+    sql = """
+SELECT DISTINCT t.trace_id, t.service_name, t.root_span_name, t.duration_ms
+FROM traces t
+WHERE 1=1
+"""
+    params: list = []
+    for key, val in span_attrs:
+        sql += "  AND EXISTS (SELECT 1 FROM attributes WHERE trace_id = t.trace_id AND scope = 'span' AND key = ? AND value_str = ?)\n"
+        params += [key, val]
+    for key, val in resource_attrs:
+        sql += "  AND EXISTS (SELECT 1 FROM attributes WHERE trace_id = t.trace_id AND scope = 'resource' AND key = ? AND value_str = ?)\n"
+        params += [key, val]
+    sql += "ORDER BY t.duration_ms DESC"
+    return sql, params
+
+
+def list_db(key: str, scope: str, with_sample: bool = False) -> tuple[str, list]:
+    if with_sample:
+        return (
+            "SELECT value_str, ANY_VALUE(trace_id) AS sample_traceID "
+            "FROM attributes WHERE scope = ? AND key = ? AND value_str IS NOT NULL "
+            "GROUP BY value_str ORDER BY value_str",
+            [scope, key],
+        )
+    return (
+        "SELECT DISTINCT value_str FROM attributes "
+        "WHERE scope = ? AND key = ? AND value_str IS NOT NULL ORDER BY value_str",
+        [scope, key],
+    )
+
+
+def schema_db(con: duckdb.DuckDBPyConnection) -> tuple[str, int]:
+    total = con.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
+    # Coalesce str/int/bool into a display string for cardinality and samples.
+    # Integer attributes (e.g. http.status_code) are tagged with "(int)".
+    sql = """
+WITH unified AS (
+    SELECT scope, key, trace_id,
+           COALESCE(
+               value_str,
+               CASE WHEN value_int IS NOT NULL THEN '(int) ' || CAST(value_int AS VARCHAR) ELSE NULL END,
+               CASE WHEN value_bool IS NOT NULL THEN CAST(value_bool AS VARCHAR) ELSE NULL END
+           ) AS display_val
+    FROM attributes
+),
+attr_vals AS (
+    SELECT scope, key, display_val,
+           COUNT(DISTINCT trace_id) AS tc,
+           ROW_NUMBER() OVER (PARTITION BY scope, key ORDER BY COUNT(DISTINCT trace_id) DESC) AS rn
+    FROM unified
+    WHERE display_val IS NOT NULL
+    GROUP BY scope, key, display_val
+),
+summary AS (
+    SELECT scope, key,
+           COUNT(DISTINCT trace_id) AS traces,
+           COUNT(DISTINCT display_val) AS cardinality
+    FROM unified
+    GROUP BY scope, key
+),
+samples AS (
+    SELECT scope, key, STRING_AGG(display_val, ', ' ORDER BY rn) AS sample_values
+    FROM attr_vals
+    WHERE rn <= 3
+    GROUP BY scope, key
+)
+SELECT s.scope, s.key, s.traces, s.cardinality, COALESCE(sa.sample_values, '') AS samples
+FROM summary s
+LEFT JOIN samples sa USING (scope, key)
+ORDER BY s.scope, s.traces DESC, s.key
+"""
+    return sql, total
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# File mode — CTE-based queries (unchanged from before)
+# ──────────────────────────────────────────────────────────────────────────────
+
 def build_values_query(file: str, key: str, attr_type: str, with_sample: bool = False) -> str:
-    # attr_type: "span" queries span_attrs CTE, "resource" queries res_attrs CTE
     cte = f"""
 WITH
 batches AS (
@@ -111,9 +350,7 @@ ORDER BY durationMs DESC
 """
 
 
-def build_query(file: str, span_attrs: list[tuple[str, str]], resource_attrs: list[tuple[str, str]]) -> str:
-    # DuckDB requires chained unnests to go through CTEs — you cannot reference
-    # an alias from one UNNEST in a subsequent UNNEST in the same FROM clause.
+def build_query(file: str, span_attrs: list, resource_attrs: list) -> str:
     cte = f"""
 WITH
 batches AS (
@@ -152,25 +389,25 @@ SELECT DISTINCT
 FROM span_attrs
 WHERE 1=1
 """
-
     conditions = []
-
     for key, val in span_attrs:
         conditions.append(
             f"  AND traceID IN ("
             f"SELECT traceID FROM span_attrs "
             f"WHERE attr.key = {key!r} AND attr.value.stringValue = {val!r})"
         )
-
     for key, val in resource_attrs:
         conditions.append(
             f"  AND traceID IN ("
             f"SELECT traceID FROM res_attrs "
             f"WHERE ra.key = {key!r} AND ra.value.stringValue = {val!r})"
         )
-
     return cte + "\n".join(conditions) + "\nORDER BY durationMs DESC"
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -178,7 +415,13 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--file", "-f", required=True, help="NDJSON file produced by notrace (--details --output json)")
+
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument("--file", "-f", metavar="FILE", help="NDJSON file (one-shot, re-parsed each query)")
+    src.add_argument("--db", metavar="PATH", help="DuckDB database file (persistent, indexed)")
+
+    parser.add_argument("--import", dest="import_file", metavar="FILE", help="Import NDJSON into --db, skipping duplicates (requires --db)")
+    parser.add_argument("--schema", action="store_true", help="Print attribute cardinality report (requires --db)")
     parser.add_argument("--span-attr", "-s", metavar="key=value", action="append", default=[], help="Filter by span attribute (repeatable, ANDed)")
     parser.add_argument("--resource-attr", "-r", metavar="key=value", action="append", default=[], help="Filter by resource attribute (repeatable, ANDed)")
     parser.add_argument("--detail", "-d", action="store_true", help="Pretty-print the full OTLP detail for each matched trace")
@@ -188,15 +431,138 @@ def main() -> None:
     parser.add_argument("--sql", action="store_true", help="Print the generated SQL instead of running it")
     args = parser.parse_args()
 
-    con = duckdb.connect()
+    if args.import_file and not args.db:
+        print("error: --import requires --db", file=sys.stderr)
+        sys.exit(1)
+    if args.schema and not args.db:
+        print("error: --schema requires --db", file=sys.stderr)
+        sys.exit(1)
+    if not args.file and not args.db:
+        print("error: one of --file or --db is required", file=sys.stderr)
+        sys.exit(1)
 
-    # --list-* flags: enumerate unique values and exit
+    con = duckdb.connect(args.db or ":memory:")
+
+    if args.db:
+        init_db(con)
+
+    # ── --import ───────────────────────────────────────────────────────────────
+
+    if args.import_file:
+        import_ndjson(con, args.import_file)
+        if not any([args.schema, args.list_resource_attr, args.list_span_attr,
+                    args.trace_id, args.span_attr, args.resource_attr]):
+            return
+
+    # ── DB mode ────────────────────────────────────────────────────────────────
+
+    if args.db:
+        # --schema
+        if args.schema:
+            sql, total = schema_db(con)
+            if args.sql:
+                show_sql(sql)
+                return
+            try:
+                rows = con.execute(sql).fetchall()
+            except duckdb.Error as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not rows:
+                print("no attributes found — import traces first with --import", file=sys.stderr)
+                return
+            print(f"ATTRIBUTE SCHEMA  (from {args.db} — {total} traces)\n")
+            print_table(rows, ["scope", "key", "traces", "cardinality", "sample values"])
+            return
+
+        # --list-*
+        for key, scope in [(args.list_resource_attr, "resource"), (args.list_span_attr, "span")]:
+            if not key:
+                continue
+            sql, params = list_db(key, scope, with_sample=args.detail)
+            if args.sql:
+                show_sql(sql, params)
+                return
+            try:
+                rows = con.execute(sql, params).fetchall()
+            except duckdb.Error as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not rows:
+                print(f"no values found for {key!r}", file=sys.stderr)
+                return
+            print(key)
+            for row in rows:
+                val = row[0]
+                if not args.detail:
+                    print(f"  {val}")
+                    continue
+                sample_id = row[1]
+                print(f"  {val}  →  {sample_id}")
+                detail_row = con.execute(
+                    "SELECT trace_id, raw_detail FROM traces WHERE trace_id = ?", [sample_id]
+                ).fetchone()
+                if detail_row:
+                    _, raw = detail_row
+                    detail = json.loads(raw) if isinstance(raw, str) else raw
+                    print(json.dumps(detail, indent=2))
+                    print()
+            return
+
+        # --trace-id
+        if args.trace_id:
+            try:
+                row = con.execute(
+                    "SELECT trace_id, raw_detail FROM traces WHERE trace_id = ?", [args.trace_id]
+                ).fetchone()
+            except duckdb.Error as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not row:
+                print(f"trace {args.trace_id!r} not found", file=sys.stderr)
+                sys.exit(1)
+            _, raw = row
+            detail = json.loads(raw) if isinstance(raw, str) else raw
+            print(json.dumps(detail, indent=2))
+            return
+
+        # filter query
+        span_attrs = parse_kv(args.span_attr)
+        resource_attrs = parse_kv(args.resource_attr)
+        sql, params = query_db(span_attrs, resource_attrs)
+        if args.sql:
+            show_sql(sql, params)
+            return
+        try:
+            rows = con.execute(sql, params).fetchall()
+        except duckdb.Error as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not rows:
+            print("no traces matched", file=sys.stderr)
+            return
+        print_table(rows, ["trace_id", "service_name", "root_span_name", "duration_ms"])
+        print(f"\n{len(rows)} trace(s) matched", file=sys.stderr)
+        if args.detail:
+            trace_ids = [r[0] for r in rows]
+            placeholders = ", ".join("?" * len(trace_ids))
+            detail_rows = con.execute(
+                f"SELECT trace_id, raw_detail FROM traces WHERE trace_id IN ({placeholders}) ORDER BY duration_ms DESC",
+                trace_ids,
+            ).fetchall()
+            print_detail_blobs(detail_rows)
+        return
+
+    # ── File mode ──────────────────────────────────────────────────────────────
+
+    file = args.file
+
     for key, attr_type in [(args.list_resource_attr, "resource"), (args.list_span_attr, "span")]:
         if not key:
             continue
-        sql = build_values_query(args.file, key, attr_type, with_sample=args.detail)
+        sql = build_values_query(file, key, attr_type, with_sample=args.detail)
         if args.sql:
-            print(sql)
+            show_sql(sql)
             return
         try:
             rows = con.execute(sql).fetchall()
@@ -214,7 +580,7 @@ def main() -> None:
                 continue
             sample_id = row[1]
             print(f"  {val}  →  {sample_id}")
-            detail_rows = con.execute(build_detail_query(args.file, [sample_id])).fetchall()
+            detail_rows = con.execute(build_detail_query(file, [sample_id])).fetchall()
             if detail_rows:
                 _, detail = detail_rows[0]
                 print(json.dumps(detail, indent=2))
@@ -222,7 +588,7 @@ def main() -> None:
         return
 
     if args.trace_id:
-        sql = build_detail_query(args.file, [args.trace_id])
+        sql = build_detail_query(file, [args.trace_id])
         try:
             rows = con.execute(sql).fetchall()
         except duckdb.Error as e:
@@ -237,11 +603,10 @@ def main() -> None:
 
     span_attrs = parse_kv(args.span_attr)
     resource_attrs = parse_kv(args.resource_attr)
-
-    sql = build_query(args.file, span_attrs, resource_attrs)
+    sql = build_query(file, span_attrs, resource_attrs)
 
     if args.sql:
-        print(sql)
+        show_sql(sql)
         return
 
     try:
@@ -256,34 +621,20 @@ def main() -> None:
         return
 
     cols = [d[0] for d in rel.description]
-    col_widths = [max(len(c), max((len(str(r[i])) for r in rows), default=0)) for i, c in enumerate(cols)]
-
-    header = "  ".join(c.upper().ljust(col_widths[i]) for i, c in enumerate(cols))
-    print(header)
-    print("  ".join("-" * w for w in col_widths))
-    for row in rows:
-        print("  ".join(str(v).ljust(col_widths[i]) for i, v in enumerate(row)))
-
+    print_table(rows, cols)
     print(f"\n{len(rows)} trace(s) matched", file=sys.stderr)
 
     if not args.detail:
         return
 
     trace_ids = [row[0] for row in rows]
-    detail_sql = build_detail_query(args.file, trace_ids)
     try:
-        detail_rows = con.execute(detail_sql).fetchall()
+        detail_rows = con.execute(build_detail_query(file, trace_ids)).fetchall()
     except duckdb.Error as e:
         print(f"error fetching detail: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print()
-    for trace_id, detail in detail_rows:
-        print(f"{'─' * 72}")
-        print(f"trace: {trace_id}")
-        print(f"{'─' * 72}")
-        print(json.dumps(detail, indent=2))
-        print()
+    print_detail_blobs(detail_rows)
 
 
 if __name__ == "__main__":

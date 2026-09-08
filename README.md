@@ -116,6 +116,12 @@ Capture traces to a file and query them with `lab/query.py`, a DuckDB-backed hel
 ./notrace tempo search --start 1h -o json --details > notrace.json
 ```
 
+Requires `pip install duckdb`. The `--details` flag must be used when capturing, otherwise span and resource attributes are not included in the output.
+
+### File mode (one-shot)
+
+Re-parses the NDJSON file on each query. Good for quick exploration on small captures.
+
 **Discover attribute keys and values:**
 
 ```bash
@@ -137,7 +143,7 @@ python3 lab/query.py -f notrace.json --list-span-attr http.route --detail
 python3 lab/query.py -f notrace.json
 
 # filter by span attribute
-python3 lab/query.py -f notrace.json --span-attr hola.code=M1234
+python3 lab/query.py -f notrace.json --span-attr http.method=GET
 
 # filter by resource attribute
 python3 lab/query.py -f notrace.json --resource-attr service.name=frontend
@@ -148,10 +154,10 @@ python3 lab/query.py -f notrace.json \
   --span-attr http.method=GET
 
 # show full OTLP detail for each matched trace
-python3 lab/query.py -f notrace.json --span-attr hola.code=M1234 --detail
+python3 lab/query.py -f notrace.json --resource-attr service.name=frontend --detail
 
 # inspect the generated SQL
-python3 lab/query.py -f notrace.json --span-attr hola.code=M1234 --sql
+python3 lab/query.py -f notrace.json --span-attr http.method=GET --sql
 ```
 
 **Drill into a specific trace:**
@@ -164,9 +170,68 @@ python3 lab/query.py -f notrace.json --trace-id 38f26ee12443bc2ef4ccb638808bb449
   | jq '.batches[].scopeSpans[].spans[].name'
 ```
 
-Typical workflow: use `--list-span-attr` to discover values → filter with `--span-attr` to find traceIDs → drill in with `--trace-id`.
+### DB mode (persistent, indexed)
 
-Requires `pip install duckdb`. The `--details` flag must be used when capturing, otherwise span and resource attributes are not included in the output.
+Imports NDJSON into a DuckDB file once, then queries the indexed tables. Faster for large captures and repeated queries.
+
+**Import:**
+
+```bash
+# first import — creates notrace.db
+python3 lab/query.py --db notrace.db --import notrace.json
+# → imported 42 trace(s), skipped 0 duplicate(s)
+
+# append more captures later — duplicates are skipped automatically
+python3 lab/query.py --db notrace.db --import more.json
+```
+
+**Explore the schema:**
+
+```bash
+# show all attribute keys, cardinality, and sample values
+python3 lab/query.py --db notrace.db --schema
+```
+
+```
+ATTRIBUTE SCHEMA  (from notrace.db — 42 traces)
+
+SCOPE     KEY                  TRACES  CARDINALITY  SAMPLE VALUES
+--------  -------------------  ------  -----------  ----------------------------
+resource  service.name         42      3            checkout, frontend, ...
+span      http.method          38      2            GET, POST
+span      http.route           38      6            /api/orders, /api/payments ...
+span      http.status_code     38      2            200, 500
+```
+
+**Filter and query:**
+
+```bash
+# list unique values for an attribute
+python3 lab/query.py --db notrace.db --list-resource-attr service.name
+python3 lab/query.py --db notrace.db --list-span-attr http.status_code
+
+# with one sample trace ID per value
+python3 lab/query.py --db notrace.db --list-span-attr http.route --detail
+
+# filter by span attribute
+python3 lab/query.py --db notrace.db --span-attr http.status_code=500
+
+# filter by resource attribute
+python3 lab/query.py --db notrace.db --resource-attr service.name=checkout
+
+# combine (ANDed)
+python3 lab/query.py --db notrace.db \
+  --resource-attr service.name=checkout \
+  --span-attr http.method=POST
+
+# show full OTLP detail for matched traces
+python3 lab/query.py --db notrace.db --resource-attr service.name=checkout --detail
+
+# drill into a specific trace
+python3 lab/query.py --db notrace.db --trace-id 38f26ee12443bc2ef4ccb638808bb449
+```
+
+Typical workflow: `--import` → `--schema` to discover keys → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--trace-id` to drill in.
 
 ## Configuration
 
