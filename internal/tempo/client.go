@@ -16,16 +16,18 @@ type Client struct {
 	baseURL    string
 	token      string
 	orgID      string
+	timeout    time.Duration
 	httpClient *http.Client
 }
 
-func NewClient(baseURL, token, orgID string) *Client {
+func NewClient(baseURL, token, orgID string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
 		orgID:   orgID,
+		timeout: timeout,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
@@ -64,7 +66,32 @@ func (c *Client) Search(ctx context.Context, q SearchQuery) (*SearchResponse, er
 	return &result, nil
 }
 
+var getTraceRetryInterval = 2 * time.Second
+
+const getTraceRetryWindow = 30 * time.Second
+
+// GetTrace fetches a full trace by ID. It retries on 404 every 2s for up to
+// 30s to handle Tempo's eventual consistency (traces appear in search results
+// before the backing block is flushed and queryable).
 func (c *Client) GetTrace(ctx context.Context, traceID string) (*TraceDetail, error) {
+	deadline := time.Now().Add(getTraceRetryWindow)
+	for {
+		result, err := c.getTrace(ctx, traceID)
+		if err == nil {
+			return result, nil
+		}
+		if err != ErrNotFound || time.Now().After(deadline) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(getTraceRetryInterval):
+		}
+	}
+}
+
+func (c *Client) getTrace(ctx context.Context, traceID string) (*TraceDetail, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/api/traces/"+traceID)
 	if err != nil {
 		return nil, err
@@ -98,10 +125,18 @@ func (c *Client) newRequest(ctx context.Context, method, path string) (*http.Req
 	return req, nil
 }
 
+// ErrNotFound is returned by GetTrace when Tempo responds with 404.
+// This is common due to eventual consistency: a traceID appears in search
+// results before the underlying block is flushed and queryable.
+var ErrNotFound = fmt.Errorf("trace not found")
+
 func checkStatus(resp *http.Response) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrNotFound
+	}
 	return fmt.Errorf("tempo %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }

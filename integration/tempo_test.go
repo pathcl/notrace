@@ -17,7 +17,7 @@ func tempoClient(t *testing.T) *tempo.Client {
 	if u == "" {
 		t.Skip("NOTRACE_TEMPO_URL not set — run 'make lab-up' then 'make test-integration'")
 	}
-	return tempo.NewClient(u, "", "")
+	return tempo.NewClient(u, "", "", 10*time.Second)
 }
 
 func TestTempoSearchReturnsTraces(t *testing.T) {

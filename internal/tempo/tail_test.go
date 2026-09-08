@@ -20,7 +20,7 @@ func TestTailerDedup(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tailer := NewTailer(NewClient(srv.URL, "", ""), TailOptions{
+	tailer := NewTailer(NewClient(srv.URL, "", "", 5*time.Second), TailOptions{
 		Query:    "{}",
 		Interval: time.Second,
 		Lookback: 30 * time.Second,
@@ -58,7 +58,7 @@ func TestTailerNewTracesDelivered(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tailer := NewTailer(NewClient(srv.URL, "", ""), TailOptions{
+	tailer := NewTailer(NewClient(srv.URL, "", "", 5*time.Second), TailOptions{
 		Query:    "{}",
 		Interval: time.Second,
 		Lookback: 30 * time.Second,
@@ -90,7 +90,7 @@ func TestTailerSlidingWindow(t *testing.T) {
 	defer srv.Close()
 
 	lookback := 30 * time.Second
-	tailer := NewTailer(NewClient(srv.URL, "", ""), TailOptions{
+	tailer := NewTailer(NewClient(srv.URL, "", "", 5*time.Second), TailOptions{
 		Query:    "{}",
 		Interval: time.Second,
 		Lookback: lookback,

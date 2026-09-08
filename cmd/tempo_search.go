@@ -42,7 +42,7 @@ func newTempoSearchCmd() *cobra.Command {
 				return fmt.Errorf("--end: %w", err)
 			}
 
-			client := tempo.NewClient(cfg.Tempo.URL, cfg.Tempo.Token, cfg.Tempo.OrgID)
+			client := tempo.NewClient(cfg.Tempo.URL, cfg.Tempo.Token, cfg.Tempo.OrgID, cfg.Tempo.Timeout)
 			resp, err := client.Search(cmd.Context(), tempo.SearchQuery{
 				Query: query,
 				Start: start.Unix(),

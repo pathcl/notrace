@@ -34,7 +34,7 @@ func newTempoTailCmd() *cobra.Command {
 				return err
 			}
 
-			client := tempo.NewClient(cfg.Tempo.URL, cfg.Tempo.Token, cfg.Tempo.OrgID)
+			client := tempo.NewClient(cfg.Tempo.URL, cfg.Tempo.Token, cfg.Tempo.OrgID, cfg.Tempo.Timeout)
 			tailer := tempo.NewTailer(client, tempo.TailOptions{
 				Query:    query,
 				Interval: interval,
