@@ -162,6 +162,7 @@ def main() -> None:
     parser.add_argument("--span-attr", "-s", metavar="key=value", action="append", default=[], help="Filter by span attribute (repeatable, ANDed)")
     parser.add_argument("--resource-attr", "-r", metavar="key=value", action="append", default=[], help="Filter by resource attribute (repeatable, ANDed)")
     parser.add_argument("--detail", "-d", action="store_true", help="Pretty-print the full OTLP detail for each matched trace")
+    parser.add_argument("--trace-id", metavar="ID", help="Pretty-print the full OTLP detail for a specific trace ID")
     parser.add_argument("--list-resource-attr", metavar="KEY", help="List unique values for a resource attribute key")
     parser.add_argument("--list-span-attr", metavar="KEY", help="List unique values for a span attribute key")
     parser.add_argument("--sql", action="store_true", help="Print the generated SQL instead of running it")
@@ -188,6 +189,20 @@ def main() -> None:
         print(key)
         for (val,) in rows:
             print(f"  {val}")
+        return
+
+    if args.trace_id:
+        sql = build_detail_query(args.file, [args.trace_id])
+        try:
+            rows = con.execute(sql).fetchall()
+        except duckdb.Error as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not rows:
+            print(f"trace {args.trace_id!r} not found", file=sys.stderr)
+            sys.exit(1)
+        _, detail = rows[0]
+        print(json.dumps(detail, indent=2))
         return
 
     span_attrs = parse_kv(args.span_attr)
