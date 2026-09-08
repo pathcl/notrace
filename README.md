@@ -200,8 +200,10 @@ SCOPE     KEY                  TRACES  CARDINALITY  SAMPLE VALUES
 resource  service.name         42      3            checkout, frontend, ...
 span      http.method          38      2            GET, POST
 span      http.route           38      6            /api/orders, /api/payments ...
-span      http.status_code     38      2            200, 500
+span      http.status_code     38      2            (int) 200, (int) 500
 ```
+
+Integer-valued attributes are tagged `(int)` in the schema and work transparently in filters — `--span-attr http.status_code=500` matches whether the value was stored as a string or integer.
 
 **Filter and query:**
 
