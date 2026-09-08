@@ -1,0 +1,40 @@
+version: "2.4"
+
+services:
+  tempo:
+    image: grafana/tempo:2.10.7
+    user: root
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./config/tempo.yaml:/etc/tempo.yaml
+      - tempo-data:/tmp/tempo
+    ports:
+      - "3200:3200"    # HTTP API / query
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yaml"
+      - "--storage.tsdb.retention.time=1h"
+    volumes:
+      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yaml
+    ports:
+      - "9090:9090"
+
+  traffic-gen:
+    build:
+      context: ./traffic-gen
+    environment:
+      - OTLP_ENDPOINT=tempo:4318
+      - TEMPO_READY_URL=http://tempo:3200/ready
+      - PROMETHEUS_ADDR=:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - tempo
+    restart: unless-stopped
+
+volumes:
+  tempo-data:
