@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/viper"
 )
 
+var verbose bool
+
 var rootCmd = &cobra.Command{
 	Use:   "notrace",
 	Short: "CLI for querying Grafana Tempo and Prometheus/Mimir",
@@ -24,6 +26,7 @@ func init() {
 	rootCmd.PersistentFlags().String("token", "", "Bearer token (env: NOTRACE_TOKEN)")
 	rootCmd.PersistentFlags().String("org-id", "", "Org ID for multi-tenant Tempo (env: NOTRACE_ORG_ID)")
 	rootCmd.PersistentFlags().Duration("timeout", 0, "HTTP request timeout, e.g. 5s, 30s (env: NOTRACE_TIMEOUT, default 10s)")
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Log HTTP requests and responses to stderr")
 
 	viper.BindPFlag("tempo.url", rootCmd.PersistentFlags().Lookup("tempo-url"))      //nolint:errcheck
 	viper.BindPFlag("tempo.token", rootCmd.PersistentFlags().Lookup("token"))        //nolint:errcheck
