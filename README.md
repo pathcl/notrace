@@ -151,6 +151,18 @@ python3 lab/query.py -f notrace.json --span-attr hola.code=M1234 --detail
 python3 lab/query.py -f notrace.json --span-attr hola.code=M1234 --sql
 ```
 
+**Drill into a specific trace:**
+
+```bash
+python3 lab/query.py -f notrace.json --trace-id 38f26ee12443bc2ef4ccb638808bb449
+
+# pipe to jq for further slicing
+python3 lab/query.py -f notrace.json --trace-id 38f26ee12443bc2ef4ccb638808bb449 \
+  | jq '.batches[].scopeSpans[].spans[].name'
+```
+
+Typical workflow: use `--list-span-attr` to discover values → filter with `--span-attr` to find traceIDs → drill in with `--trace-id`.
+
 Requires `pip install duckdb`. The `--details` flag must be used when capturing, otherwise span and resource attributes are not included in the output.
 
 ## Configuration
