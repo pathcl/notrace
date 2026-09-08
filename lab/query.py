@@ -37,35 +37,47 @@ def parse_kv(values: list[str]) -> list[tuple[str, str]]:
     return result
 
 
-def build_values_query(file: str, key: str, attr_type: str) -> str:
+def build_values_query(file: str, key: str, attr_type: str, with_sample: bool = False) -> str:
     # attr_type: "span" queries span_attrs CTE, "resource" queries res_attrs CTE
     cte = f"""
 WITH
 batches AS (
-    SELECT UNNEST(detail.batches) AS b
+    SELECT traceID, UNNEST(detail.batches) AS b
     FROM read_json({file!r}, format = 'newline_delimited', auto_detect = true)
 ),
 scope_spans AS (
-    SELECT b.resource.attributes AS resource_attrs,
+    SELECT traceID,
+           b.resource.attributes AS resource_attrs,
            UNNEST(b.scopeSpans) AS ss
     FROM batches
 ),
 spans AS (
-    SELECT resource_attrs,
+    SELECT traceID,
+           resource_attrs,
            UNNEST(ss.spans) AS sp
     FROM scope_spans
 ),
 span_attrs AS (
-    SELECT resource_attrs,
+    SELECT traceID,
+           resource_attrs,
            UNNEST(sp.attributes) AS attr
     FROM spans
 ),
 res_attrs AS (
-    SELECT UNNEST(resource_attrs) AS ra
+    SELECT traceID,
+           UNNEST(resource_attrs) AS ra
     FROM span_attrs
 )
 """
     if attr_type == "resource":
+        if with_sample:
+            return cte + f"""
+SELECT ra.value.stringValue AS value, ANY_VALUE(traceID) AS sample_traceID
+FROM res_attrs
+WHERE ra.key = {key!r} AND ra.value.stringValue IS NOT NULL
+GROUP BY 1
+ORDER BY 1
+"""
         return cte + f"""
 SELECT DISTINCT ra.value.stringValue AS value
 FROM res_attrs
@@ -73,6 +85,14 @@ WHERE ra.key = {key!r} AND ra.value.stringValue IS NOT NULL
 ORDER BY 1
 """
     else:
+        if with_sample:
+            return cte + f"""
+SELECT attr.value.stringValue AS value, ANY_VALUE(traceID) AS sample_traceID
+FROM span_attrs
+WHERE attr.key = {key!r} AND attr.value.stringValue IS NOT NULL
+GROUP BY 1
+ORDER BY 1
+"""
         return cte + f"""
 SELECT DISTINCT attr.value.stringValue AS value
 FROM span_attrs
@@ -174,7 +194,7 @@ def main() -> None:
     for key, attr_type in [(args.list_resource_attr, "resource"), (args.list_span_attr, "span")]:
         if not key:
             continue
-        sql = build_values_query(args.file, key, attr_type)
+        sql = build_values_query(args.file, key, attr_type, with_sample=args.detail)
         if args.sql:
             print(sql)
             return
@@ -187,8 +207,18 @@ def main() -> None:
             print(f"no values found for {key!r}", file=sys.stderr)
             return
         print(key)
-        for (val,) in rows:
-            print(f"  {val}")
+        for row in rows:
+            val = row[0]
+            if not args.detail:
+                print(f"  {val}")
+                continue
+            sample_id = row[1]
+            print(f"  {val}  →  {sample_id}")
+            detail_rows = con.execute(build_detail_query(args.file, [sample_id])).fetchall()
+            if detail_rows:
+                _, detail = detail_rows[0]
+                print(json.dumps(detail, indent=2))
+                print()
         return
 
     if args.trace_id:
