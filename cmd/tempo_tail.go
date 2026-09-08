@@ -19,6 +19,7 @@ func newTempoTailCmd() *cobra.Command {
 		interval time.Duration
 		output   string
 		details  bool
+		limit    int
 	)
 
 	cmd := &cobra.Command{
@@ -39,6 +40,7 @@ func newTempoTailCmd() *cobra.Command {
 				Query:    query,
 				Interval: interval,
 				Lookback: 30 * time.Second,
+				Limit:    limit,
 			})
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -67,6 +69,7 @@ func newTempoTailCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "Poll interval")
 	cmd.Flags().StringVarP(&output, "output", "o", "table", "Output format: table, json")
 	cmd.Flags().BoolVarP(&details, "details", "d", false, "Fetch and display resource and span attributes for each trace")
+	cmd.Flags().IntVar(&limit, "limit", 100, "Max traces to fetch per poll")
 
 	return cmd
 }

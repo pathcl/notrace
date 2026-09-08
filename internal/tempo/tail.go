@@ -11,6 +11,7 @@ type TailOptions struct {
 	Query    string
 	Interval time.Duration
 	Lookback time.Duration
+	Limit    int
 }
 
 type Tailer struct {
@@ -59,11 +60,15 @@ func (t *Tailer) poll(ctx context.Context, seen map[string]time.Time, fn func([]
 		}
 	}
 
+	limit := t.opts.Limit
+	if limit <= 0 {
+		limit = 100
+	}
 	resp, err := t.client.Search(ctx, SearchQuery{
 		Query: t.opts.Query,
 		Start: cutoff.Unix(),
 		End:   now.Unix(),
-		Limit: 100,
+		Limit: limit,
 	})
 	if err != nil {
 		return err
