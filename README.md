@@ -125,6 +125,9 @@ python3 lab/query.py -f notrace.json --list-resource-attr service.name
 # unique values for a span attribute key
 python3 lab/query.py -f notrace.json --list-span-attr http.method
 python3 lab/query.py -f notrace.json --list-span-attr http.status_code
+
+# add --detail to show one sample trace per unique value
+python3 lab/query.py -f notrace.json --list-span-attr http.route --detail
 ```
 
 **Filter traces:**
