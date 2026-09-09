@@ -233,7 +233,36 @@ python3 lab/query.py --db notrace.db --resource-attr service.name=checkout --det
 python3 lab/query.py --db notrace.db --trace-id 38f26ee12443bc2ef4ccb638808bb449
 ```
 
-Typical workflow: `--import` → `--schema` to discover keys → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--trace-id` to drill in.
+**Span relationship analysis:**
+
+```bash
+# cross-service call graph (caller → callee, per operation)
+python3 lab/query.py --db notrace.db --service-graph
+```
+
+```
+CALLER    CALLEE       OPERATION          CALLS  AVG_MS  MAX_MS
+--------  -----------  -----------------  -----  ------  ------
+frontend  db           SELECT products    27     0.02    0.08
+frontend  cache        GET products:list  27     0.00    0.02
+checkout  payment-svc  ChargeCard         17     0.01    0.08
+checkout  db           INSERT orders      17     0.02    0.07
+```
+
+```bash
+# span tree for a single trace (depth-indented)
+python3 lab/query.py --db notrace.db --span-tree <trace-id>
+```
+
+```
+GET /api/products  [frontend · SERVER]  90.36ms
+  SELECT products  [frontend · CLIENT]  0.06ms
+  GET products:list  [frontend · CLIENT]  0.00ms
+```
+
+`--service-graph` and `--span-tree` require `--db` and a prior `--import`. If the `spans` table is empty (e.g. imported with an older version), re-run `--import` on the same file to populate it.
+
+Typical workflow: `--import` → `--schema` to discover keys → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--span-tree` to inspect a trace → `--service-graph` to see call topology.
 
 ## Configuration
 

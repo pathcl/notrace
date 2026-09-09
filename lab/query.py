@@ -105,6 +105,21 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_attr_key_val ON attributes (key, value_str)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_attr_trace   ON attributes (trace_id)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS spans (
+            trace_id        VARCHAR,
+            span_id         VARCHAR,
+            parent_span_id  VARCHAR,
+            service_name    VARCHAR,
+            component       VARCHAR,
+            span_name       VARCHAR,
+            kind            VARCHAR,
+            start_ns        BIGINT,
+            duration_ns     BIGINT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_spans_trace  ON spans (trace_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans (parent_span_id)")
 
 
 def _extract_attr(attr: dict) -> tuple:
@@ -171,21 +186,43 @@ def import_ndjson(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
 
             if detail:
                 attr_rows = []
+                span_rows = []
                 for batch in detail.get("batches", []):
                     for attr in batch.get("resource", {}).get("attributes", []):
                         key, str_val, int_val, bool_val = _extract_attr(attr)
                         attr_rows.append((trace_id, None, "resource", key, str_val, int_val, bool_val))
 
                     for scope_span in batch.get("scopeSpans", []):
+                        svc = scope_span.get("scope", {}).get("name", "")
                         for span in scope_span.get("spans", []):
                             span_name = span.get("name", "")
+                            span_id = span.get("spanId", "")
+                            parent_id = span.get("parentSpanId", "")
+                            kind = span.get("kind", "")
+                            component = None
+                            try:
+                                start_ns = int(span.get("startTimeUnixNano", "0") or "0")
+                                end_ns = int(span.get("endTimeUnixNano", "0") or "0")
+                                duration_ns = max(0, end_ns - start_ns)
+                            except (ValueError, TypeError):
+                                start_ns = 0
+                                duration_ns = 0
+
                             for attr in span.get("attributes", []):
+                                if attr.get("key") == "component":
+                                    component = attr.get("value", {}).get("stringValue")
                                 key, str_val, int_val, bool_val = _extract_attr(attr)
                                 attr_rows.append((trace_id, span_name, "span", key, str_val, int_val, bool_val))
+
+                            span_rows.append((trace_id, span_id, parent_id, svc, component, span_name, kind, start_ns, duration_ns))
 
                 if attr_rows:
                     con.executemany(
                         "INSERT INTO attributes VALUES (?, ?, ?, ?, ?, ?, ?)", attr_rows
+                    )
+                if span_rows:
+                    con.executemany(
+                        "INSERT INTO spans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", span_rows
                     )
 
             imported += 1
@@ -290,6 +327,74 @@ LEFT JOIN samples sa USING (scope, key)
 ORDER BY s.scope, s.traces DESC, s.key
 """
     return sql, total
+
+
+def service_graph_db() -> str:
+    # callee: use component attribute when present (e.g. db, cache, payment-svc),
+    # otherwise fall back to service_name from scope. This handles both real
+    # multi-resource OTLP (different batches per service) and single-resource
+    # traces where downstream components are tagged with a component attribute.
+    return """
+SELECT
+    p.service_name                                      AS caller,
+    COALESCE(NULLIF(c.component, ''), c.service_name)  AS callee,
+    c.span_name                                        AS operation,
+    COUNT(*)                                           AS calls,
+    ROUND(AVG(c.duration_ns / 1e6), 2)                AS avg_ms,
+    ROUND(MAX(c.duration_ns / 1e6), 2)                AS max_ms
+FROM spans c
+JOIN spans p
+  ON c.parent_span_id = p.span_id
+ AND c.trace_id = p.trace_id
+WHERE c.parent_span_id != ''
+  AND COALESCE(NULLIF(c.component, ''), c.service_name) != p.service_name
+GROUP BY 1, 2, 3
+ORDER BY calls DESC
+"""
+
+
+def span_tree_db(trace_id: str) -> tuple[str, list]:
+    sql = """
+WITH RECURSIVE
+trace_spans AS (
+    SELECT * FROM spans WHERE trace_id = ?
+),
+tree AS (
+    SELECT span_id, parent_span_id, service_name, span_name, kind, duration_ns, start_ns, 0 AS depth
+    FROM trace_spans
+    WHERE parent_span_id = '' OR parent_span_id IS NULL
+    UNION ALL
+    SELECT s.span_id, s.parent_span_id, s.service_name, s.span_name, s.kind, s.duration_ns, s.start_ns, t.depth + 1
+    FROM trace_spans s
+    JOIN tree t ON s.parent_span_id = t.span_id
+)
+SELECT depth, service_name, span_name, kind, duration_ns
+FROM tree
+ORDER BY start_ns
+"""
+    return sql, [trace_id]
+
+
+def print_span_tree(rows: list) -> None:
+    for row in rows:
+        depth, service, span_name, kind, duration_ns = row
+        ms = (duration_ns or 0) / 1e6
+        indent = "  " * depth
+        kind_short = (kind or "").replace("SPAN_KIND_", "")
+        print(f"{indent}{span_name}  [{service} · {kind_short}]  {ms:.2f}ms")
+
+
+def _check_spans(con: duckdb.DuckDBPyConnection, db_path: str) -> bool:
+    span_count = con.execute("SELECT COUNT(*) FROM spans").fetchone()[0]
+    trace_count = con.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
+    if span_count == 0 and trace_count > 0:
+        print(
+            f"warn: spans table is empty — re-import: "
+            f"python3 lab/query.py --db {db_path} --import <file>",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -441,6 +546,8 @@ def main() -> None:
 
     parser.add_argument("--import", dest="import_file", metavar="FILE", help="Import NDJSON into --db, skipping duplicates (requires --db)")
     parser.add_argument("--schema", action="store_true", help="Print attribute cardinality report (requires --db)")
+    parser.add_argument("--service-graph", action="store_true", help="Print cross-service call edges (requires --db)")
+    parser.add_argument("--span-tree", metavar="TRACE_ID", help="Print span tree for a trace ID (requires --db)")
     parser.add_argument("--span-attr", "-s", metavar="key=value", action="append", default=[], help="Filter by span attribute (repeatable, ANDed)")
     parser.add_argument("--resource-attr", "-r", metavar="key=value", action="append", default=[], help="Filter by resource attribute (repeatable, ANDed)")
     parser.add_argument("--detail", "-d", action="store_true", help="Pretty-print the full OTLP detail for each matched trace")
@@ -455,6 +562,12 @@ def main() -> None:
         sys.exit(1)
     if args.schema and not args.db:
         print("error: --schema requires --db", file=sys.stderr)
+        sys.exit(1)
+    if args.service_graph and not args.db:
+        print("error: --service-graph requires --db", file=sys.stderr)
+        sys.exit(1)
+    if args.span_tree and not args.db:
+        print("error: --span-tree requires --db", file=sys.stderr)
         sys.exit(1)
     if not args.file and not args.db:
         print("error: one of --file or --db is required", file=sys.stderr)
@@ -492,6 +605,44 @@ def main() -> None:
                 return
             print(f"ATTRIBUTE SCHEMA  (from {args.db} — {total} traces)\n")
             print_table(rows, ["scope", "key", "traces", "cardinality", "sample values"])
+            return
+
+        # --service-graph
+        if args.service_graph:
+            if not _check_spans(con, args.db):
+                return
+            sql = service_graph_db()
+            if args.sql:
+                show_sql(sql)
+                return
+            try:
+                rows = con.execute(sql).fetchall()
+            except duckdb.Error as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not rows:
+                print("no cross-service calls found", file=sys.stderr)
+                return
+            print_table(rows, ["caller", "callee", "operation", "calls", "avg_ms", "max_ms"])
+            return
+
+        # --span-tree
+        if args.span_tree:
+            if not _check_spans(con, args.db):
+                return
+            sql, params = span_tree_db(args.span_tree)
+            if args.sql:
+                show_sql(sql, params)
+                return
+            try:
+                rows = con.execute(sql, params).fetchall()
+            except duckdb.Error as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not rows:
+                print(f"trace {args.span_tree!r} not found or has no spans", file=sys.stderr)
+                sys.exit(1)
+            print_span_tree(rows)
             return
 
         # --list-*
