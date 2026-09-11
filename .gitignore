@@ -1,3 +1,5 @@
 CLAUDE.md
 tasks/
 notrace
+lab/traffic-gen/traffic-gen
+lab/__pycache__/
