@@ -17,6 +17,7 @@ func newTempoTailCmd() *cobra.Command {
 	var (
 		query    string
 		interval time.Duration
+		lookback time.Duration
 		output   string
 		details  bool
 		limit    int
@@ -40,14 +41,14 @@ func newTempoTailCmd() *cobra.Command {
 			tailer := tempo.NewTailer(client, tempo.TailOptions{
 				Query:    query,
 				Interval: interval,
-				Lookback: 30 * time.Second,
+				Lookback: lookback,
 				Limit:    limit,
 			})
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			fmt.Fprintf(os.Stderr, "tailing %s  query=%s  interval=%s\n", cfg.Tempo.URL, query, interval)
+			fmt.Fprintf(os.Stderr, "tailing %s  query=%s  interval=%s  lookback=%s\n", cfg.Tempo.URL, query, interval, lookback)
 
 			return tailer.Run(ctx, func(traces []tempo.TraceSearchMetadata) error {
 				if !details {
@@ -69,6 +70,7 @@ func newTempoTailCmd() *cobra.Command {
 
 	cmd.Flags().StringVarP(&query, "query", "q", "{}", "TraceQL query")
 	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "Poll interval")
+	cmd.Flags().DurationVar(&lookback, "lookback", 30*time.Second, "Sliding window size; increase if p99 trace duration exceeds the default")
 	cmd.Flags().StringVarP(&output, "output", "o", "table", "Output format: table, json")
 	cmd.Flags().BoolVarP(&details, "details", "d", false, "Fetch and display resource and span attributes for each trace")
 	cmd.Flags().IntVar(&limit, "limit", 100, "Max traces to fetch per poll")
