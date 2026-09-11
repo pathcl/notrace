@@ -384,6 +384,41 @@ def print_span_tree(rows: list) -> None:
         print(f"{indent}{span_name}  [{service} · {kind_short}]  {ms:.2f}ms")
 
 
+def time_series_db(key: str, bucket: str) -> tuple[str, list]:
+    trunc = {"minute": "minute", "hour": "hour", "day": "day"}.get(bucket, "hour")
+    # EXISTS avoids over-counting: attributes has no span_id, so a JOIN on
+    # span_name would create a cartesian product when multiple attribute rows
+    # share the same span_name within a trace.
+    sql = f"""
+SELECT
+    DATE_TRUNC('{trunc}', to_timestamp(s.start_ns / 1e9)) AS bucket,
+    COUNT(*)                                               AS occurrences
+FROM spans s
+WHERE EXISTS (
+    SELECT 1 FROM attributes a
+    WHERE a.trace_id  = s.trace_id
+      AND a.span_name = s.span_name
+      AND a.scope     = 'span'
+      AND a.key       = ?
+)
+GROUP BY 1
+ORDER BY 1
+"""
+    return sql, [key]
+
+
+def print_time_series(rows: list, key: str, bucket: str) -> None:
+    max_count = max(r[1] for r in rows)
+    bar_width = 40
+    fmt = {"minute": "%Y-%m-%d %H:%M", "hour": "%Y-%m-%d %H:00", "day": "%Y-%m-%d"}.get(bucket, "%Y-%m-%d %H:00")
+    print(f"\n{key}  (per {bucket})\n")
+    for ts, count in rows:
+        bar = "█" * max(1, int(count / max_count * bar_width))
+        label = ts.strftime(fmt) if hasattr(ts, "strftime") else str(ts)[:16]
+        print(f"  {label}  {bar:<{bar_width}}  {count}")
+    print()
+
+
 def _check_spans(con: duckdb.DuckDBPyConnection, db_path: str) -> bool:
     span_count = con.execute("SELECT COUNT(*) FROM spans").fetchone()[0]
     trace_count = con.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
@@ -567,6 +602,8 @@ def main() -> None:
     parser.add_argument("--schema", action="store_true", help="Print attribute cardinality report (requires --db)")
     parser.add_argument("--service-graph", action="store_true", help="Print cross-service call edges (requires --db)")
     parser.add_argument("--span-tree", metavar="TRACE_ID", help="Print span tree for a trace ID (requires --db)")
+    parser.add_argument("--time-series", metavar="KEY", help="Show occurrences of a span attribute key over time (requires --db)")
+    parser.add_argument("--bucket", choices=["minute", "hour", "day"], default="hour", help="Time bucket size for --time-series (default: hour)")
     parser.add_argument("--span-attr", "-s", metavar="key=value", action="append", default=[], help="Filter by span attribute (repeatable, ANDed)")
     parser.add_argument("--resource-attr", "-r", metavar="key=value", action="append", default=[], help="Filter by resource attribute (repeatable, ANDed)")
     parser.add_argument("--detail", "-d", action="store_true", help="Pretty-print the full OTLP detail for each matched trace")
@@ -587,6 +624,9 @@ def main() -> None:
         sys.exit(1)
     if args.span_tree and not args.db:
         print("error: --span-tree requires --db", file=sys.stderr)
+        sys.exit(1)
+    if args.time_series and not args.db:
+        print("error: --time-series requires --db", file=sys.stderr)
         sys.exit(1)
     if not args.file and not args.db:
         print("error: one of --file or --db is required", file=sys.stderr)
@@ -662,6 +702,25 @@ def main() -> None:
                 print(f"trace {args.span_tree!r} not found or has no spans", file=sys.stderr)
                 sys.exit(1)
             print_span_tree(rows)
+            return
+
+        # --time-series
+        if args.time_series:
+            if not _check_spans(con, args.db):
+                return
+            sql, params = time_series_db(args.time_series, args.bucket)
+            if args.sql:
+                show_sql(sql, params)
+                return
+            try:
+                rows = con.execute(sql, params).fetchall()
+            except duckdb.Error as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not rows:
+                print(f"no spans found with attribute {args.time_series!r}", file=sys.stderr)
+                return
+            print_time_series(rows, args.time_series, args.bucket)
             return
 
         # --list-*
