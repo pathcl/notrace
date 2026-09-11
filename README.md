@@ -314,7 +314,33 @@ http.route  (per hour)
 
 `--bucket` accepts `minute`, `hour` (default), or `day`. The bar chart is proportionally scaled to the busiest bucket. Useful as a starting point for heatmap analysis — each row is a time bucket, the count is how many spans carried that attribute during that window.
 
-Typical workflow: `--import` → `--schema` to discover keys → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--span-tree` to inspect a trace → `--service-graph` to see call topology → `--time-series` to spot activity patterns over time.
+**Root span duration stats:**
+
+```bash
+python3 lab/query.py --db notrace.db --duration-stats
+```
+
+```
+ROOT SPAN DURATION STATS
+
+  traces  : 20
+  min     : 19.4 ms
+  avg     : 104.2 ms
+  p50     : 55.8 ms
+  p95     : 343.7 ms
+  p99     : 455.1 ms
+  max     : 483.0 ms
+
+  recommended --lookback for `notrace tempo tail`: 30s
+```
+
+Useful for sizing the `--lookback` window on `notrace tempo tail`. The default lookback is 30 seconds — if your p99 root span duration exceeds that, traces that are still in-flight when the window slides past their start time will be missed. `--duration-stats` computes a recommended value (`ceil(p99 × 1.5)`, rounded up to the nearest 30s) so you can set it explicitly:
+
+```bash
+notrace tempo tail --lookback 90s   # if --duration-stats recommends 90s
+```
+
+Typical workflow: `--import` → `--schema` to discover keys → `--duration-stats` to size your tail window → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--span-tree` to inspect a trace → `--service-graph` to see call topology → `--time-series` to spot activity patterns over time.
 
 ## Configuration
 
