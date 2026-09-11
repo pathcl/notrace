@@ -209,60 +209,49 @@ class NeighbourGraph:
 
 
 class WatchHeatmap:
-    """Live scrolling heatmap: one row per time bucket, columns per attribute value."""
+    """Heatmap bucketed by real span startTimeUnixNano — accurate for both
+    live tail and offline file analysis."""
 
     def __init__(self, key: str, filter_val: str | None = None, interval: float = 10.0) -> None:
         self.key = key
         self.filter_val = filter_val  # when set, columns = co-occurring services
-        self.interval = interval
-        self.current: Counter = Counter()
-        self.values: list[str] = []   # ordered by first seen
+        self.interval = interval      # bucket width in seconds
+        self.buckets: dict[int, Counter] = {}  # bucket_epoch_s → Counter
+        self.values: list[str] = []            # ordered by first seen
         self._seen: set[str] = set()
-        self.bucket_start = time.monotonic()
-        self.rows = 0
-        self._header_ncols = 0        # column count at last header print
 
-    def add(self, value: str) -> None:
+    def add(self, value: str, span_ts_ns: int) -> None:
+        bucket = int(span_ts_ns / 1e9 // self.interval * self.interval)
         if value not in self._seen:
             self.values.append(value)
             self._seen.add(value)
-        self.current[value] += 1
+        self.buckets.setdefault(bucket, Counter())[value] += 1
 
     def col_width(self, val: str) -> int:
-        return max(len(val), _BAR + 4)  # bar + space + up to 3-digit count
+        return max(len(val), _BAR + 4)
 
-    def _print_header(self) -> None:
-        if self.rows > 0:
-            print(file=sys.stderr)
+    def flush(self) -> None:
+        if not self.buckets or not self.values:
+            return
         label = f"{self.key}={self.filter_val}" if self.filter_val else self.key
-        print(f"\n{label}  (live, {self.interval:.0f}s buckets)\n", file=sys.stderr)
-        parts = [f"{'':10}"]
+        print(f"\n{label}  ({self.interval:.0f}s buckets)\n", file=sys.stderr)
+        parts = [f"{'':19}"]
         for val in self.values:
             parts.append(f"{val:<{self.col_width(val)}}")
         print("  " + "  ".join(parts), file=sys.stderr)
-        self._header_ncols = len(self.values)
 
-    def flush(self) -> None:
-        if not self.values:
-            self.bucket_start = time.monotonic()
-            return
-        if len(self.values) > self._header_ncols:
-            self._print_header()
-        max_cnt = max(self.current.values()) if self.current else 1
-        ts = datetime.now().strftime("%H:%M:%S")
-        parts = [f"{ts:<10}"]
-        for val in self.values:
-            cnt = self.current.get(val, 0)
-            bar = "█" * int(cnt / max_cnt * _BAR) if max_cnt > 0 else ""
-            cell = f"{bar} {cnt}" if cnt else ""
-            parts.append(f"{cell:<{self.col_width(val)}}")
-        print("  " + "  ".join(parts), file=sys.stderr, flush=True)
-        self.rows += 1
-        self.current = Counter()
-        self.bucket_start = time.monotonic()
-
-    def time_to_flush(self) -> float:
-        return max(0.0, self.interval - (time.monotonic() - self.bucket_start))
+        max_cnt = max(max(c.values()) for c in self.buckets.values())
+        for ts_s in sorted(self.buckets):
+            cnt_map = self.buckets[ts_s]
+            dt = datetime.fromtimestamp(ts_s, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            row = [f"{dt:<19}"]
+            for val in self.values:
+                cnt = cnt_map.get(val, 0)
+                bar = "█" * int(cnt / max_cnt * _BAR) if max_cnt > 0 else ""
+                cell = f"{bar} {cnt}" if cnt else ""
+                row.append(f"{cell:<{self.col_width(val)}}")
+            print("  " + "  ".join(row), file=sys.stderr)
+        print(file=sys.stderr)
 
 
 def _feed_heatmap(heatmap: WatchHeatmap, trace: dict) -> None:
@@ -270,31 +259,35 @@ def _feed_heatmap(heatmap: WatchHeatmap, trace: dict) -> None:
     batches = detail.get("batches") or []
 
     if heatmap.filter_val is None:
-        # key-only mode: columns = unique values of the attribute
+        # key-only mode: bucket each matching span by its own start time
         for batch in batches:
             for scope_spans in batch.get("scopeSpans") or []:
                 for span in scope_spans.get("spans") or []:
+                    ts_ns = int(span.get("startTimeUnixNano") or 0)
+                    if not ts_ns:
+                        continue
                     for attr in span.get("attributes") or []:
                         if attr.get("key") == heatmap.key:
                             val = _attr_str(attr.get("value") or {})
                             if val:
-                                heatmap.add(val)
+                                heatmap.add(val, ts_ns)
     else:
-        # key=value mode: columns = co-occurring services in matching traces
-        matched = any(
-            _attr_str(attr.get("value") or {}) == heatmap.filter_val
-            for batch in batches
-            for scope_spans in batch.get("scopeSpans") or []
-            for span in scope_spans.get("spans") or []
-            for attr in span.get("attributes") or []
-            if attr.get("key") == heatmap.key
-        )
-        if matched:
+        # key=value mode: find earliest matching span ts, bucket co-occurring services there
+        match_ts: int = 0
+        for batch in batches:
+            for scope_spans in batch.get("scopeSpans") or []:
+                for span in scope_spans.get("spans") or []:
+                    ts_ns = int(span.get("startTimeUnixNano") or 0)
+                    for attr in span.get("attributes") or []:
+                        if attr.get("key") == heatmap.key and _attr_str(attr.get("value") or {}) == heatmap.filter_val:
+                            if not match_ts or ts_ns < match_ts:
+                                match_ts = ts_ns
+        if match_ts:
             seen: set[str] = set()
             for batch in batches:
                 svc = _batch_service(batch)
                 if svc and svc not in seen:
-                    heatmap.add(svc)
+                    heatmap.add(svc, match_ts)
                     seen.add(svc)
 
 
@@ -324,21 +317,7 @@ def run_stats(watch_key: str | None = None) -> None:
     signal.signal(signal.SIGTERM, _print_and_exit)
 
     try:
-        while True:
-            if heatmap:
-                timeout = heatmap.time_to_flush()
-                ready, _, _ = select.select([sys.stdin], [], [], timeout)
-                if not ready:
-                    heatmap.flush()
-                    continue
-                line = sys.stdin.readline()
-                if not line:
-                    break
-            else:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-
+        for line in sys.stdin:
             line = line.strip()
             if not line:
                 continue
@@ -346,14 +325,12 @@ def run_stats(watch_key: str | None = None) -> None:
                 trace = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
             stats.ingest(trace)
             if heatmap:
                 _feed_heatmap(heatmap, trace)
             if neighbours:
                 neighbours.ingest(trace)
-            if not heatmap:
-                print(f"\r{stats.traces} traces ingested...", end="", file=sys.stderr, flush=True)
+            print(f"\r{stats.traces} traces ingested...", end="", file=sys.stderr, flush=True)
     except (EOFError, BrokenPipeError):
         pass
 
