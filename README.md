@@ -88,6 +88,34 @@ notrace tempo search --start 1h --details -v
 
 Polls Tempo on a sliding 30-second window, deduplicates by traceID, and prints new traces as they arrive. Each poll logs a status line to stderr (`polled=N new=N seen=N`). Press Ctrl-C to stop.
 
+**How it works**
+
+Tempo has no streaming API, so `tail` simulates it with a poll loop:
+
+```
+start immediately → poll → wait 5s → poll → wait 5s → ...
+```
+
+Each poll calls `GET /api/search` with a sliding time window (`start=now-30s, end=now`). A `seen` map tracks which traceIDs have already been emitted; entries older than 30s are evicted before each poll so traces that re-enter the window are shown again.
+
+```
+every 5s:
+  GET /api/search?start=now-30s&end=now&q={}   ← sliding window, always 30s wide
+            │ N trace IDs returned
+            ▼
+    filter against seen{}
+            │ M new IDs
+            ▼
+    (if --details) GET /api/traces/{id}         ← one per new trace
+            │ retries on 404 up to 30s          ← Tempo eventual consistency
+            ▼
+    emit to stdout
+```
+
+If `--details` is set, each new trace triggers a second call to `GET /api/traces/{traceID}` to fetch the full OTLP span tree. Tempo can return 404 here even though the trace appeared in search (the search index is updated before the block is flushed). The client retries on 404 every 2s for up to 30s before giving up.
+
+> **Limitation**: traces longer than 30 seconds (i.e. whose root span duration exceeds the lookback window) will not be captured reliably. The lookback is fixed at 30s.
+
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--query` | `-q` | `{}` | TraceQL expression |
