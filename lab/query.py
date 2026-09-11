@@ -402,12 +402,16 @@ def _check_spans(con: duckdb.DuckDBPyConnection, db_path: str) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _require_detail_field(con: duckdb.DuckDBPyConnection, file: str) -> None:
-    """Exit with a clear message if the NDJSON was captured without --details."""
+    """Exit with a clear message if the NDJSON was captured without --details.
+
+    Uses WHERE detail IS NOT NULL so that early lines where GetTrace failed
+    (and detail was omitted) do not trigger a false positive.
+    """
     try:
         row = con.execute(
-            f"SELECT detail IS NOT NULL FROM read_json({file!r}, format='newline_delimited', auto_detect=true) LIMIT 1"
+            f"SELECT 1 FROM read_json({file!r}, format='newline_delimited', auto_detect=true) WHERE detail IS NOT NULL LIMIT 1"
         ).fetchone()
-        has_detail = row and row[0]
+        has_detail = row is not None
     except duckdb.Error:
         has_detail = False
     if not has_detail:
