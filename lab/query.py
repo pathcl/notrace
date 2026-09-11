@@ -119,11 +119,101 @@ class StreamStats:
 _BAR = 8  # bar width in characters for heatmap cells
 
 
+def _attr_str(v: dict) -> str:
+    """Extract a string representation from an OTLP attribute value dict."""
+    return (
+        v.get("stringValue")
+        or (str(v["intValue"]) if "intValue" in v else "")
+        or (str(v["boolValue"]).lower() if "boolValue" in v else "")
+    )
+
+
+def _batch_service(batch: dict) -> str:
+    for a in (batch.get("resource") or {}).get("attributes") or []:
+        if a.get("key") == "service.name":
+            return (a.get("value") or {}).get("stringValue", "")
+    return ""
+
+
+class NeighbourGraph:
+    """Accumulates direct caller→callee edges and co-occurring services for traces
+    that contain at least one span where key=val."""
+
+    def __init__(self, key: str, val: str) -> None:
+        self.key = key
+        self.val = val
+        self.matched = 0
+        self.total = 0
+        self.edges: Counter = Counter()        # (caller_svc, callee_svc) → count
+        self.cooccurring: Counter = Counter()  # service → trace count
+
+    def ingest(self, trace: dict) -> None:
+        self.total += 1
+        detail = trace.get("detail") or {}
+        batches = detail.get("batches") or []
+
+        # span_id → {service, parent_id}
+        span_map: dict[str, dict] = {}
+        matching: list[str] = []
+
+        for batch in batches:
+            svc = _batch_service(batch)
+            for scope_spans in batch.get("scopeSpans") or []:
+                for span in scope_spans.get("spans") or []:
+                    sid = span.get("spanId", "")
+                    span_map[sid] = {"service": svc, "parent": span.get("parentSpanId", "")}
+                    for attr in span.get("attributes") or []:
+                        if attr.get("key") == self.key and _attr_str(attr.get("value") or {}) == self.val:
+                            matching.append(sid)
+
+        if not matching:
+            return
+        self.matched += 1
+
+        # build children index
+        children: dict[str, list[str]] = {}
+        for sid, info in span_map.items():
+            p = info["parent"]
+            if p:
+                children.setdefault(p, []).append(sid)
+
+        # direct edges around each matching span
+        for sid in matching:
+            svc = span_map.get(sid, {}).get("service", "")
+            parent_id = span_map.get(sid, {}).get("parent", "")
+            if parent_id in span_map:
+                psvc = span_map[parent_id]["service"]
+                if psvc and psvc != svc:
+                    self.edges[(psvc, svc)] += 1
+            for cid in children.get(sid, []):
+                csvc = span_map[cid]["service"]
+                if csvc and csvc != svc:
+                    self.edges[(svc, csvc)] += 1
+
+        # co-occurring services (one count per trace per service)
+        for svc in {info["service"] for info in span_map.values() if info["service"]}:
+            self.cooccurring[svc] += 1
+
+    def print(self) -> None:
+        print(f"\nNEIGHBOURS for {self.key}={self.val}  ({self.matched}/{self.total} traces matched)\n", file=sys.stderr)
+        if self.edges:
+            print("  direct edges (caller → callee):", file=sys.stderr)
+            for (caller, callee), cnt in self.edges.most_common():
+                print(f"    {caller:<25}  →  {callee:<25}  {cnt}", file=sys.stderr)
+            print(file=sys.stderr)
+        if self.cooccurring:
+            print("  co-occurring services (same trace):", file=sys.stderr)
+            for svc, cnt in self.cooccurring.most_common():
+                print(f"    {svc:<25}  {cnt}", file=sys.stderr)
+            print(file=sys.stderr)
+
+
 class WatchHeatmap:
     """Live scrolling heatmap: one row per time bucket, columns per attribute value."""
 
-    def __init__(self, key: str, interval: float = 10.0) -> None:
+    def __init__(self, key: str, filter_val: str | None = None, interval: float = 10.0) -> None:
         self.key = key
+        self.filter_val = filter_val  # when set, columns = co-occurring services
         self.interval = interval
         self.current: Counter = Counter()
         self.values: list[str] = []   # ordered by first seen
@@ -144,7 +234,8 @@ class WatchHeatmap:
     def _print_header(self) -> None:
         if self.rows > 0:
             print(file=sys.stderr)
-        print(f"\n{self.key}  (live, {self.interval:.0f}s buckets)\n", file=sys.stderr)
+        label = f"{self.key}={self.filter_val}" if self.filter_val else self.key
+        print(f"\n{label}  (live, {self.interval:.0f}s buckets)\n", file=sys.stderr)
         parts = [f"{'':10}"]
         for val in self.values:
             parts.append(f"{val:<{self.col_width(val)}}")
@@ -176,30 +267,56 @@ class WatchHeatmap:
 
 def _feed_heatmap(heatmap: WatchHeatmap, trace: dict) -> None:
     detail = trace.get("detail") or {}
-    for batch in detail.get("batches") or []:
-        for scope_spans in batch.get("scopeSpans") or []:
-            for span in scope_spans.get("spans") or []:
-                for attr in span.get("attributes") or []:
-                    if attr.get("key") != heatmap.key:
-                        continue
-                    v = attr.get("value", {})
-                    val = (
-                        v.get("stringValue")
-                        or (str(v["intValue"]) if "intValue" in v else "")
-                        or (str(v["boolValue"]).lower() if "boolValue" in v else "")
-                    )
-                    if val:
-                        heatmap.add(val)
+    batches = detail.get("batches") or []
+
+    if heatmap.filter_val is None:
+        # key-only mode: columns = unique values of the attribute
+        for batch in batches:
+            for scope_spans in batch.get("scopeSpans") or []:
+                for span in scope_spans.get("spans") or []:
+                    for attr in span.get("attributes") or []:
+                        if attr.get("key") == heatmap.key:
+                            val = _attr_str(attr.get("value") or {})
+                            if val:
+                                heatmap.add(val)
+    else:
+        # key=value mode: columns = co-occurring services in matching traces
+        matched = any(
+            _attr_str(attr.get("value") or {}) == heatmap.filter_val
+            for batch in batches
+            for scope_spans in batch.get("scopeSpans") or []
+            for span in scope_spans.get("spans") or []
+            for attr in span.get("attributes") or []
+            if attr.get("key") == heatmap.key
+        )
+        if matched:
+            seen: set[str] = set()
+            for batch in batches:
+                svc = _batch_service(batch)
+                if svc and svc not in seen:
+                    heatmap.add(svc)
+                    seen.add(svc)
 
 
 def run_stats(watch_key: str | None = None) -> None:
     stats = StreamStats()
-    heatmap = WatchHeatmap(watch_key) if watch_key else None
+    neighbours: NeighbourGraph | None = None
+    heatmap: WatchHeatmap | None = None
+
+    if watch_key:
+        if "=" in watch_key:
+            key, _, val = watch_key.partition("=")
+            neighbours = NeighbourGraph(key.strip(), val.strip())
+            heatmap = WatchHeatmap(key.strip(), filter_val=val.strip())
+        else:
+            heatmap = WatchHeatmap(watch_key)
 
     def _print_and_exit(signum=None, frame=None) -> None:
         print(file=sys.stderr)
         if heatmap:
             heatmap.flush()
+        if neighbours:
+            neighbours.print()
         stats.print()
         sys.exit(0)
 
@@ -233,7 +350,9 @@ def run_stats(watch_key: str | None = None) -> None:
             stats.ingest(trace)
             if heatmap:
                 _feed_heatmap(heatmap, trace)
-            else:
+            if neighbours:
+                neighbours.ingest(trace)
+            if not heatmap:
                 print(f"\r{stats.traces} traces ingested...", end="", file=sys.stderr, flush=True)
     except (EOFError, BrokenPipeError):
         pass
@@ -241,6 +360,8 @@ def run_stats(watch_key: str | None = None) -> None:
     print(file=sys.stderr)
     if heatmap:
         heatmap.flush()
+    if neighbours:
+        neighbours.print()
     stats.print()
 
 
