@@ -19,7 +19,11 @@ Requires:
 
 import argparse
 import json
+import math
+import signal
 import sys
+import time
+from collections import Counter
 from datetime import datetime, timezone
 
 try:
@@ -27,6 +31,116 @@ try:
 except ImportError:
     print("error: duckdb not installed — run: pip install duckdb", file=sys.stderr)
     sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Streaming stats (--stats, reads stdin)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class StreamStats:
+    def __init__(self) -> None:
+        self.traces = 0
+        self.root_durations: list[float] = []   # ms
+        self.span_attrs: Counter = Counter()
+        self.services: Counter = Counter()
+        self.errors = 0
+        self.started = time.monotonic()
+
+    def ingest(self, trace: dict) -> None:
+        self.traces += 1
+        detail = trace.get("detail") or {}
+        for batch in detail.get("batches", []):
+            resource_attrs = {
+                a["key"]: a.get("value", {})
+                for a in batch.get("resource", {}).get("attributes", [])
+            }
+            svc = resource_attrs.get("service.name", {}).get("stringValue", "")
+
+            for scope_spans in batch.get("scopeSpans", []):
+                for span in scope_spans.get("spans", []):
+                    parent = span.get("parentSpanId", "")
+                    dur_ns = int(span.get("endTimeUnixNano", 0)) - int(span.get("startTimeUnixNano", 0))
+                    if not parent:
+                        self.root_durations.append(dur_ns / 1e6)
+                        if svc:
+                            self.services[svc] += 1
+
+                    for attr in span.get("attributes", []):
+                        key = attr.get("key", "")
+                        if key:
+                            self.span_attrs[key] += 1
+
+                    if span.get("status", {}).get("code") == "STATUS_CODE_ERROR":
+                        self.errors += 1
+
+    def print(self) -> None:
+        elapsed = time.monotonic() - self.started
+        mins, secs = divmod(int(elapsed), 60)
+        elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        print(f"\nLIVE STREAM STATS  ({self.traces} traces, {elapsed_str})\n", file=sys.stderr)
+
+        # duration percentiles
+        if self.root_durations:
+            d = sorted(self.root_durations)
+            n = len(d)
+            def pct(p: float) -> float:
+                idx = max(0, min(n - 1, int(math.ceil(p / 100 * n)) - 1))
+                return d[idx]
+            p99 = pct(99)
+            rec_s = max(30, math.ceil(math.ceil(p99 / 1000 * 1.5) / 30) * 30)
+            print("  root span duration", file=sys.stderr)
+            print(f"    min    {d[0]:.1f} ms", file=sys.stderr)
+            print(f"    p50    {pct(50):.1f} ms", file=sys.stderr)
+            print(f"    p95    {pct(95):.1f} ms", file=sys.stderr)
+            print(f"    p99    {p99:.1f} ms", file=sys.stderr)
+            print(f"    max    {d[-1]:.1f} ms", file=sys.stderr)
+            print(f"    recommended --lookback: {rec_s}s", file=sys.stderr)
+            print(file=sys.stderr)
+
+        if self.errors:
+            print(f"  errors (STATUS_CODE_ERROR): {self.errors}", file=sys.stderr)
+            print(file=sys.stderr)
+
+        if self.span_attrs:
+            print("  top span attributes (by occurrence)", file=sys.stderr)
+            for key, cnt in self.span_attrs.most_common(8):
+                print(f"    {key:<35} {cnt}", file=sys.stderr)
+            print(file=sys.stderr)
+
+        if self.services:
+            print("  top services (by root span count)", file=sys.stderr)
+            for svc, cnt in self.services.most_common(8):
+                print(f"    {svc:<35} {cnt}", file=sys.stderr)
+            print(file=sys.stderr)
+
+
+def run_stats() -> None:
+    stats = StreamStats()
+
+    def _print_and_exit(signum=None, frame=None) -> None:
+        stats.print()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _print_and_exit)
+    signal.signal(signal.SIGTERM, _print_and_exit)
+
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                trace = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            stats.ingest(trace)
+            print(f"\r{stats.traces} traces ingested...", end="", file=sys.stderr, flush=True)
+    except (EOFError, BrokenPipeError):
+        pass
+
+    print(file=sys.stderr)  # newline after the counter
+    stats.print()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -630,6 +744,8 @@ def main() -> None:
         epilog=__doc__,
     )
 
+    parser.add_argument("--stats", action="store_true", help="Read NDJSON from stdin and print live stream stats on EOF/Ctrl-C (pipe mode)")
+
     src = parser.add_mutually_exclusive_group()
     src.add_argument("--file", "-f", metavar="FILE", help="NDJSON file (one-shot, re-parsed each query)")
     src.add_argument("--db", metavar="PATH", help="DuckDB database file (persistent, indexed)")
@@ -649,6 +765,10 @@ def main() -> None:
     parser.add_argument("--list-span-attr", metavar="KEY", help="List unique values for a span attribute key")
     parser.add_argument("--sql", action="store_true", help="Print the generated SQL instead of running it")
     args = parser.parse_args()
+
+    if args.stats:
+        run_stats()
+        return
 
     if args.import_file and not args.db:
         print("error: --import requires --db", file=sys.stderr)
