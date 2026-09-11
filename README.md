@@ -138,6 +138,8 @@ notrace tempo tail --limit 500 -v
 
 > **Sizing `--lookback`**: if your p99 root span duration exceeds 30s, traces that are still in-flight when the window slides past their start time will be missed. Use `--duration-stats` to measure your p99 and set `--lookback` accordingly — the recommended value is printed automatically.
 
+> **Performance**: widening `--lookback` does not slow down the poll loop — it only changes the time range of the `GET /api/search` request. The `seen` map deduplicates everything already captured so a wider window does not cause re-processing. The one case to watch is a very large lookback (hours) combined with a high `--limit` and `--details`: each poll may return many new traces, each triggering a `GET /api/traces/{id}` call. For typical adjustments (30s → 60s) the difference is negligible.
+
 ## Live pipe analysis
 
 Pipe `notrace tempo tail` directly into `query.py --stats` for real-time stream analysis — no file or DB needed.
