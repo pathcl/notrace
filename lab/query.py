@@ -419,6 +419,42 @@ def print_time_series(rows: list, key: str, bucket: str) -> None:
     print()
 
 
+def duration_stats_db() -> str:
+    return """
+SELECT
+    COUNT(*)                                                              AS root_spans,
+    MIN(duration_ns)  / 1e6                                              AS min_ms,
+    AVG(duration_ns)  / 1e6                                              AS avg_ms,
+    MAX(duration_ns)  / 1e6                                              AS max_ms,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ns) / 1e6     AS p50_ms,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ns) / 1e6     AS p95_ms,
+    PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ns) / 1e6     AS p99_ms
+FROM spans
+WHERE parent_span_id IS NULL OR parent_span_id = ''
+"""
+
+
+def print_duration_stats(row: tuple) -> None:
+    root_spans, min_ms, avg_ms, max_ms, p50_ms, p95_ms, p99_ms = row
+    # recommend a tail lookback window: ceil(p99 * 1.5), rounded to a clean interval
+    import math
+    rec_s = math.ceil(p99_ms / 1000 * 1.5)
+    if rec_s < 30:
+        rec_s = 30
+    # round up to nearest 30s
+    rec_s = math.ceil(rec_s / 30) * 30
+    print("\nROOT SPAN DURATION STATS\n")
+    print(f"  traces  : {int(root_spans)}")
+    print(f"  min     : {min_ms:.1f} ms")
+    print(f"  avg     : {avg_ms:.1f} ms")
+    print(f"  p50     : {p50_ms:.1f} ms")
+    print(f"  p95     : {p95_ms:.1f} ms")
+    print(f"  p99     : {p99_ms:.1f} ms")
+    print(f"  max     : {max_ms:.1f} ms")
+    print(f"\n  recommended --lookback for `notrace tempo tail`: {rec_s}s")
+    print()
+
+
 def _check_spans(con: duckdb.DuckDBPyConnection, db_path: str) -> bool:
     span_count = con.execute("SELECT COUNT(*) FROM spans").fetchone()[0]
     trace_count = con.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
@@ -604,6 +640,7 @@ def main() -> None:
     parser.add_argument("--span-tree", metavar="TRACE_ID", help="Print span tree for a trace ID (requires --db)")
     parser.add_argument("--time-series", metavar="KEY", help="Show occurrences of a span attribute key over time (requires --db)")
     parser.add_argument("--bucket", choices=["minute", "hour", "day"], default="hour", help="Time bucket size for --time-series (default: hour)")
+    parser.add_argument("--duration-stats", action="store_true", help="Show root span duration percentiles and recommended tail lookback (requires --db)")
     parser.add_argument("--span-attr", "-s", metavar="key=value", action="append", default=[], help="Filter by span attribute (repeatable, ANDed)")
     parser.add_argument("--resource-attr", "-r", metavar="key=value", action="append", default=[], help="Filter by resource attribute (repeatable, ANDed)")
     parser.add_argument("--detail", "-d", action="store_true", help="Pretty-print the full OTLP detail for each matched trace")
@@ -627,6 +664,9 @@ def main() -> None:
         sys.exit(1)
     if args.time_series and not args.db:
         print("error: --time-series requires --db", file=sys.stderr)
+        sys.exit(1)
+    if args.duration_stats and not args.db:
+        print("error: --duration-stats requires --db", file=sys.stderr)
         sys.exit(1)
     if not args.file and not args.db:
         print("error: one of --file or --db is required", file=sys.stderr)
@@ -721,6 +761,25 @@ def main() -> None:
                 print(f"no spans found with attribute {args.time_series!r}", file=sys.stderr)
                 return
             print_time_series(rows, args.time_series, args.bucket)
+            return
+
+        # --duration-stats
+        if args.duration_stats:
+            if not _check_spans(con, args.db):
+                return
+            sql = duration_stats_db()
+            if args.sql:
+                show_sql(sql)
+                return
+            try:
+                row = con.execute(sql).fetchone()
+            except duckdb.Error as e:
+                print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not row or row[0] == 0:
+                print("no root spans found — import traces first with --import", file=sys.stderr)
+                return
+            print_duration_stats(row)
             return
 
         # --list-*
