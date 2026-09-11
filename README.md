@@ -134,6 +134,69 @@ notrace tempo tail --limit 500 -v
 
 > **Note**: without `--details`, output contains only search metadata (traceID, service name, duration). Span and resource attributes are **not** included. If you plan to analyse the output with `query.py`, you must pass `--details`.
 
+## Live pipe analysis
+
+Pipe `notrace tempo tail` directly into `query.py --stats` for real-time stream analysis — no file or DB needed.
+
+> **`--details` is required.** Without it the output contains no span or resource attributes.
+
+```bash
+./notrace tempo tail -o json --details | python3 lab/query.py --stats
+```
+
+Press Ctrl-C (or let the pipe close) to print a summary:
+
+```
+LIVE STREAM STATS  (48 traces, 9s)
+
+  root span duration
+    min    11.4 ms
+    p50    45.3 ms
+    p95    435.2 ms
+    p99    487.2 ms
+    max    487.2 ms
+    recommended --lookback: 30s
+
+  errors (STATUS_CODE_ERROR): 11
+
+  top span attributes (by occurrence)
+    component                           97
+    http.route                          42
+    http.method                         42
+    http.status_code                    42
+
+  top services (by root span count)
+    traffic-gen                         48
+```
+
+**Live heatmap — `--watch KEY`**
+
+Add `--watch KEY` to see a scrolling heatmap of a span attribute's values over 10-second buckets. Each column is a unique value; bar width is proportional to the busiest value in that bucket.
+
+```bash
+# which downstream services are being called, and how often
+./notrace tempo tail -o json --details | python3 lab/query.py --stats --watch component
+
+# HTTP route activity over time
+./notrace tempo tail -o json --details | python3 lab/query.py --stats --watch http.route
+
+# error vs success ratio live
+./notrace tempo tail -o json --details | python3 lab/query.py --stats --watch http.status_code
+```
+
+```
+component  (live, 10s buckets)
+
+              db            payment-svc   cache
+  09:07:14    ████████ 49   █ 11          ████ 27
+  09:07:24    ████████ 24   ██ 6          ████ 12
+  09:07:34    ████████ 28   █ 6           ████ 16
+```
+
+New columns appear automatically as new attribute values are seen. On Ctrl-C the full `--stats` summary prints below the heatmap.
+
+If you're not sure which attribute keys are available, let `--stats` run for a minute — the "top span attributes" block tells you what's flowing through.
+
 ## Offline analysis
 
 Capture traces to a file and query them with `lab/query.py`, a DuckDB-backed helper that filters by span and resource attributes.
