@@ -65,7 +65,7 @@ Available on every subcommand:
 
 ### `notrace tempo search`
 
-One-shot query for traces over a time range.
+One-shot query for traces over a time range. Calls `GET /api/search` once with the given time bounds and TraceQL filter, then exits. If `--details` is set, it follows up with `GET /api/traces/{traceID}` for each result (streaming output as each trace resolves, retrying on 404 up to 30s for Tempo's eventual consistency).
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
