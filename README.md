@@ -296,7 +296,25 @@ GET /api/products  [frontend · SERVER]  90.36ms
 
 `--service-graph` and `--span-tree` require `--db` and a prior `--import`. If the `spans` table is empty (e.g. imported with an older version), re-run `--import` on the same file to populate it.
 
-Typical workflow: `--import` → `--schema` to discover keys → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--span-tree` to inspect a trace → `--service-graph` to see call topology.
+**Attribute activity over time:**
+
+```bash
+# how many spans had a given attribute active, per time bucket
+python3 lab/query.py --db notrace.db --time-series http.route
+python3 lab/query.py --db notrace.db --time-series http.status_code --bucket minute
+python3 lab/query.py --db notrace.db --time-series component --bucket day
+```
+
+```
+http.route  (per hour)
+
+  2026-09-11 08:00  ████████████████████████████████████████  11
+  2026-09-11 09:00  ██████████████                            4
+```
+
+`--bucket` accepts `minute`, `hour` (default), or `day`. The bar chart is proportionally scaled to the busiest bucket. Useful as a starting point for heatmap analysis — each row is a time bucket, the count is how many spans carried that attribute during that window.
+
+Typical workflow: `--import` → `--schema` to discover keys → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--span-tree` to inspect a trace → `--service-graph` to see call topology → `--time-series` to spot activity patterns over time.
 
 ## Configuration
 
