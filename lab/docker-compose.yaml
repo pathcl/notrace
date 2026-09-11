@@ -10,8 +10,36 @@ services:
       - tempo-data:/tmp/tempo
     ports:
       - "3200:3200"    # HTTP API / query
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      - CLICKHOUSE_DB=otel
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ports:
+      - "9000:9000"    # native TCP
+      - "8123:8123"    # HTTP interface
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.160.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./config/otel-collector.yaml:/etc/otel-collector.yaml
+    ports:
       - "4317:4317"    # OTLP gRPC
       - "4318:4318"    # OTLP HTTP
+    depends_on:
+      - tempo
+      - clickhouse
+    restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:v2.55.1
@@ -27,14 +55,15 @@ services:
     build:
       context: ./traffic-gen
     environment:
-      - OTLP_ENDPOINT=tempo:4318
+      - OTLP_ENDPOINT=otel-collector:4318
       - TEMPO_READY_URL=http://tempo:3200/ready
       - PROMETHEUS_ADDR=:8080
     ports:
       - "8080:8080"
     depends_on:
-      - tempo
+      - otel-collector
     restart: unless-stopped
 
 volumes:
   tempo-data:
+  clickhouse-data:
