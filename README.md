@@ -201,6 +201,39 @@ component  (live, 10s buckets)
 
 New columns appear automatically as new attribute values are seen. On Ctrl-C the full `--stats` summary prints below the heatmap.
 
+**Neighbour graph — `--watch KEY=VALUE`**
+
+Passing a value filters traces to those containing at least one span where `KEY=VALUE`, then builds a service graph from those traces. The heatmap columns become co-occurring services rather than attribute values, and a `NEIGHBOURS` block prints on Ctrl-C showing direct caller→callee edges (derived from `parentSpanId`) and all services that appear alongside the matching spans.
+
+```bash
+# find which services neighbour spans with my.baggage.attr=example
+cat sample.json | python3 lab/query.py --stats --watch my.baggage.attr=example
+
+# live: which services co-occur with error status codes
+./notrace tempo tail -o json --details | python3 lab/query.py --stats --watch http.status_code=500
+```
+
+```
+http.status_code=500  (live, 10s buckets)
+
+              frontend      checkout
+  10:15:00    ████████ 8    ████ 4
+  10:15:10    ████ 4        ██ 2
+
+NEIGHBOURS for http.status_code=500  (12/48 traces matched)
+
+  direct edges (caller → callee):
+    frontend    →  checkout     8
+    checkout    →  payment-svc  4
+
+  co-occurring services (same trace):
+    frontend      12
+    checkout       8
+    payment-svc    4
+```
+
+Direct edges require each service to emit its own OTLP resource batch. Co-occurring services work regardless of how spans are grouped in the export.
+
 If you're not sure which attribute keys are available, let `--stats` run for a minute — the "top span attributes" block tells you what's flowing through.
 
 `--stats` and `--watch` also work on a captured file — pipe it the same way:
