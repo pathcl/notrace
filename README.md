@@ -31,7 +31,7 @@ export NOTRACE_TEMPO_URL=http://localhost:3200
 
 ## Lab
 
-A local stack with Tempo, Prometheus, and a synthetic traffic generator.
+A local stack with Tempo, ClickHouse, an OpenTelemetry Collector, Prometheus, and a synthetic traffic generator.
 
 ```bash
 make lab-up      # start (builds traffic-gen image, waits for healthy)
@@ -41,13 +41,30 @@ make lab-down    # stop and remove volumes
 
 Services once up:
 
-| Service    | URL                       |
-|------------|---------------------------|
-| Tempo API  | http://localhost:3200      |
-| Prometheus | http://localhost:9090      |
-| Metrics    | http://localhost:8080      |
+| Service          | URL                       | Purpose                                      |
+|------------------|---------------------------|----------------------------------------------|
+| OTel Collector   | localhost:4317 (gRPC)     | OTLP ingestion, fans out to Tempo + ClickHouse |
+|                  | localhost:4318 (HTTP)     |                                              |
+| Tempo API        | http://localhost:3200     | Live tail, TraceQL, trace lookup             |
+| ClickHouse HTTP  | http://localhost:8123     | Long-term analytics (7-day TTL)              |
+| ClickHouse TCP   | localhost:9000            | Native client / `clickhouse-client`          |
+| Prometheus       | http://localhost:9090     | Metrics                                      |
+| Metrics          | http://localhost:8080     | traffic-gen Prometheus endpoint              |
 
-The traffic generator runs three goroutines simulating `frontend`, `checkout`, and `background-worker` services, with ~15% error injection, sending OTLP traces to Tempo and exposing Prometheus metrics.
+The traffic generator sends OTLP to the collector, which fans out to both stores:
+
+```
+traffic-gen → otel-collector → Tempo      (live tail, TraceQL, short-term)
+                             → ClickHouse  (analytical queries, 7-day retention)
+```
+
+Traces land in `otel.otel_traces` in ClickHouse automatically. Query them directly:
+
+```bash
+docker exec lab-clickhouse-1 clickhouse-client \
+  --query "SELECT ServiceName, count(), round(avg(Duration)/1e6,2) avg_ms
+           FROM otel.otel_traces GROUP BY ServiceName"
+```
 
 ## Commands
 
