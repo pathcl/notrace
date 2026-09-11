@@ -15,7 +15,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -38,21 +37,53 @@ var (
 	}, []string{"service", "operation"})
 )
 
+// tracers holds one tracer per logical service. Each tracer is backed by its
+// own TracerProvider with the correct service.name resource, so spans are
+// exported in separate OTLP batches — matching a real multi-service deployment.
+type tracers struct {
+	frontend   trace.Tracer
+	checkout   trace.Tracer
+	paymentSvc trace.Tracer
+	db         trace.Tracer
+	cache      trace.Tracer
+	bgWorker   trace.Tracer
+}
+
 func main() {
 	prometheus.MustRegister(requestsTotal, requestDurationMs)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	tp, err := initTracer(ctx)
-	if err != nil {
-		log.Fatalf("init tracer: %v", err)
+	endpoint := resolveEndpoint(os.Getenv("OTLP_ENDPOINT"))
+
+	serviceNames := []string{"frontend", "checkout", "payment-svc", "db", "cache", "background-worker"}
+	providers := make([]*sdktrace.TracerProvider, 0, len(serviceNames))
+	providerMap := make(map[string]*sdktrace.TracerProvider, len(serviceNames))
+	for _, name := range serviceNames {
+		tp, err := newTracerProvider(ctx, name, endpoint)
+		if err != nil {
+			log.Fatalf("init tracer for %s: %v", name, err)
+		}
+		providers = append(providers, tp)
+		providerMap[name] = tp
 	}
 	defer func() {
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutCancel()
-		tp.Shutdown(shutCtx) //nolint:errcheck
+		for _, tp := range providers {
+			tp.Shutdown(shutCtx) //nolint:errcheck
+		}
 	}()
+
+	t := tracers{
+		frontend:   providerMap["frontend"].Tracer("frontend"),
+		checkout:   providerMap["checkout"].Tracer("checkout"),
+		paymentSvc: providerMap["payment-svc"].Tracer("payment-svc"),
+		db:         providerMap["db"].Tracer("db"),
+		cache:      providerMap["cache"].Tracer("cache"),
+		bgWorker:   providerMap["background-worker"].Tracer("background-worker"),
+	}
 
 	addr := os.Getenv("PROMETHEUS_ADDR")
 	if addr == "" {
@@ -80,9 +111,9 @@ func main() {
 
 	var wg sync.WaitGroup
 	wg.Add(3)
-	go func() { defer wg.Done(); runFrontend(ctx) }()
-	go func() { defer wg.Done(); runCheckout(ctx) }()
-	go func() { defer wg.Done(); runBackground(ctx) }()
+	go func() { defer wg.Done(); runFrontend(ctx, t) }()
+	go func() { defer wg.Done(); runCheckout(ctx, t) }()
+	go func() { defer wg.Done(); runBackground(ctx, t) }()
 
 	<-ctx.Done()
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -91,17 +122,10 @@ func main() {
 	wg.Wait()
 }
 
-func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
-	endpoint := os.Getenv("OTLP_ENDPOINT")
-	if endpoint == "" {
-		endpoint = "localhost:4318"
-	}
-
-	// Strip scheme if caller passed a full URL.
-	if u, err := url.Parse("http://" + endpoint); err == nil && u.Host != "" {
-		endpoint = u.Host
-	}
-
+// newTracerProvider creates a TracerProvider for a single service, exporting
+// to the given OTLP HTTP endpoint. Each provider sets service.name on its
+// resource so spans appear as separate services in Tempo and ClickHouse.
+func newTracerProvider(ctx context.Context, serviceName, endpoint string) (*sdktrace.TracerProvider, error) {
 	exp, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpoint(endpoint),
 		otlptracehttp.WithInsecure(),
@@ -109,25 +133,30 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create OTLP exporter: %w", err)
 	}
-
 	res, err := resource.New(ctx,
-		resource.WithAttributes(semconv.ServiceNameKey.String("traffic-gen")),
+		resource.WithAttributes(semconv.ServiceNameKey.String(serviceName)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create resource: %w", err)
 	}
-
-	tp := sdktrace.NewTracerProvider(
+	return sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(res),
-	)
-	otel.SetTracerProvider(tp)
-	return tp, nil
+	), nil
+}
+
+func resolveEndpoint(raw string) string {
+	if raw == "" {
+		return "localhost:4318"
+	}
+	if u, err := url.Parse("http://" + raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
 }
 
 // runFrontend simulates HTTP traffic to a product-browsing frontend service.
-func runFrontend(ctx context.Context) {
-	tracer := otel.Tracer("frontend")
+func runFrontend(ctx context.Context, t tracers) {
 	ops := []struct{ method, route string }{
 		{"GET", "/api/products"},
 		{"GET", "/api/users/{id}"},
@@ -136,9 +165,9 @@ func runFrontend(ctx context.Context) {
 	}
 	for {
 		op := ops[rand.Intn(len(ops))]
-		simulateHTTPRequest(ctx, tracer, "frontend", op.method, op.route, func(ctx context.Context) {
-			simulateChildSpan(ctx, tracer, "db", "SELECT products", jitter(5, 40))
-			simulateChildSpan(ctx, tracer, "cache", "GET products:list", jitter(1, 5))
+		simulateHTTPRequest(ctx, t.frontend, "frontend", op.method, op.route, func(ctx context.Context) {
+			simulateChildSpan(ctx, t.db, "SELECT products", jitter(5, 40))
+			simulateChildSpan(ctx, t.cache, "GET products:list", jitter(1, 5))
 		})
 		if !sleep(ctx, jitter(300*time.Millisecond, 1200*time.Millisecond)) {
 			return
@@ -147,8 +176,7 @@ func runFrontend(ctx context.Context) {
 }
 
 // runCheckout simulates order-placement traffic with deeper call chains.
-func runCheckout(ctx context.Context) {
-	tracer := otel.Tracer("checkout")
+func runCheckout(ctx context.Context, t tracers) {
 	ops := []struct{ method, route string }{
 		{"POST", "/api/orders"},
 		{"GET", "/api/orders/{id}"},
@@ -156,10 +184,10 @@ func runCheckout(ctx context.Context) {
 	}
 	for {
 		op := ops[rand.Intn(len(ops))]
-		simulateHTTPRequest(ctx, tracer, "checkout", op.method, op.route, func(ctx context.Context) {
-			simulateChildSpan(ctx, tracer, "db", "INSERT orders", jitter(10, 60))
-			simulateChildSpan(ctx, tracer, "payment-svc", "ChargeCard", jitter(50, 200))
-			simulateChildSpan(ctx, tracer, "db", "UPDATE inventory", jitter(5, 20))
+		simulateHTTPRequest(ctx, t.checkout, "checkout", op.method, op.route, func(ctx context.Context) {
+			simulateChildSpan(ctx, t.db, "INSERT orders", jitter(10, 60))
+			simulateChildSpan(ctx, t.paymentSvc, "ChargeCard", jitter(50, 200))
+			simulateChildSpan(ctx, t.db, "UPDATE inventory", jitter(5, 20))
 		})
 		if !sleep(ctx, jitter(800*time.Millisecond, 2500*time.Millisecond)) {
 			return
@@ -168,12 +196,11 @@ func runCheckout(ctx context.Context) {
 }
 
 // runBackground simulates periodic background jobs (inventory sync, email, etc.).
-func runBackground(ctx context.Context) {
-	tracer := otel.Tracer("background-worker")
+func runBackground(ctx context.Context, t tracers) {
 	jobs := []string{"sync-inventory", "send-notifications", "cleanup-sessions"}
 	for {
 		job := jobs[rand.Intn(len(jobs))]
-		simulateJob(ctx, tracer, job)
+		simulateJob(ctx, t.bgWorker, job)
 		if !sleep(ctx, jitter(2*time.Second, 5*time.Second)) {
 			return
 		}
@@ -187,7 +214,6 @@ func simulateHTTPRequest(ctx context.Context, tracer trace.Tracer, service, meth
 	ctx, span := tracer.Start(ctx, method+" "+route,
 		trace.WithSpanKind(trace.SpanKindServer),
 		trace.WithAttributes(
-			attribute.String("service.name", service),
 			attribute.String("http.method", method),
 			attribute.String("http.route", route),
 		),
@@ -213,10 +239,12 @@ func simulateHTTPRequest(ctx context.Context, tracer trace.Tracer, service, meth
 	requestDurationMs.WithLabelValues(service, method+" "+route).Observe(dur)
 }
 
-func simulateChildSpan(ctx context.Context, tracer trace.Tracer, component, op string, d time.Duration) {
+// simulateChildSpan starts a client span using the child service's own tracer.
+// The ctx carries the parent span, so parentSpanId is set automatically by the
+// OTel SDK — no explicit propagation needed when running in-process.
+func simulateChildSpan(ctx context.Context, tracer trace.Tracer, op string, d time.Duration) {
 	_, span := tracer.Start(ctx, op,
 		trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(attribute.String("component", component)),
 	)
 	defer span.End()
 	time.Sleep(d)

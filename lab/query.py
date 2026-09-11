@@ -148,6 +148,31 @@ class NeighbourGraph:
         self.cooccurring: Counter = Counter()  # service → trace count
 
     def ingest(self, trace: dict) -> None:
+        """Process one trace and update edge and co-occurrence counters.
+
+        Two data points are extracted from the OTLP structure:
+
+        1. ``service.name`` — taken from ``batch.resource.attributes``, NOT from
+           span attributes. This is the OTLP resource field set on the
+           TracerProvider of the emitting service. Every span inside a batch
+           inherits this value. Two spans have different services only when they
+           come from separate OTLP batches with different resource service.name
+           values (i.e. genuinely separate services each running their own SDK).
+
+        2. ``spanId`` / ``parentSpanId`` — W3C trace context fields on the span
+           itself. When service B calls service C, the OTel SDK on service C sets
+           parentSpanId = the spanId of the B span that initiated the call. This
+           stitches the distributed trace tree across service boundaries.
+
+        Edge formation (requires both sides present in the stream):
+        - If matched_span.parentSpanId resolves to a span from a different
+          service → record edge (parent_service → matched_service).
+        - If a child of the matched span belongs to a different service
+          → record edge (matched_service → child_service).
+
+        Co-occurring services: every distinct resource service.name seen
+        anywhere in the trace is counted once, regardless of parentage.
+        """
         self.total += 1
         detail = trace.get("detail") or {}
         batches = detail.get("batches") or []
