@@ -401,6 +401,21 @@ def _check_spans(con: duckdb.DuckDBPyConnection, db_path: str) -> bool:
 # File mode — CTE-based queries (unchanged from before)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _require_detail_field(con: duckdb.DuckDBPyConnection, file: str) -> None:
+    """Exit with a clear message if the NDJSON was captured without --details."""
+    try:
+        row = con.execute(
+            f"SELECT detail IS NOT NULL FROM read_json({file!r}, format='newline_delimited', auto_detect=true) LIMIT 1"
+        ).fetchone()
+        has_detail = row and row[0]
+    except duckdb.Error:
+        has_detail = False
+    if not has_detail:
+        print("error: file has no 'detail' field — re-capture with --details:", file=sys.stderr)
+        print("  notrace tempo tail -o json --details >> notrace.json", file=sys.stderr)
+        print("  notrace tempo search --start 1h -o json --details > notrace.json", file=sys.stderr)
+        sys.exit(1)
+
 def build_values_query(file: str, key: str, attr_type: str, with_sample: bool = False) -> str:
     cte = f"""
 WITH
@@ -726,6 +741,7 @@ def main() -> None:
     # ── File mode ──────────────────────────────────────────────────────────────
 
     file = args.file
+    _require_detail_field(con, file)
 
     for key, attr_type in [(args.list_resource_attr, "resource"), (args.list_span_attr, "span")]:
         if not key:
