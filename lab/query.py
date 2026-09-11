@@ -20,6 +20,7 @@ Requires:
 import argparse
 import json
 import math
+import select
 import signal
 import sys
 import time
@@ -115,10 +116,90 @@ class StreamStats:
             print(file=sys.stderr)
 
 
-def run_stats() -> None:
+_BAR = 8  # bar width in characters for heatmap cells
+
+
+class WatchHeatmap:
+    """Live scrolling heatmap: one row per time bucket, columns per attribute value."""
+
+    def __init__(self, key: str, interval: float = 10.0) -> None:
+        self.key = key
+        self.interval = interval
+        self.current: Counter = Counter()
+        self.values: list[str] = []   # ordered by first seen
+        self._seen: set[str] = set()
+        self.bucket_start = time.monotonic()
+        self.rows = 0
+        self._header_ncols = 0        # column count at last header print
+
+    def add(self, value: str) -> None:
+        if value not in self._seen:
+            self.values.append(value)
+            self._seen.add(value)
+        self.current[value] += 1
+
+    def col_width(self, val: str) -> int:
+        return max(len(val), _BAR + 4)  # bar + space + up to 3-digit count
+
+    def _print_header(self) -> None:
+        if self.rows > 0:
+            print(file=sys.stderr)
+        print(f"\n{self.key}  (live, {self.interval:.0f}s buckets)\n", file=sys.stderr)
+        parts = [f"{'':10}"]
+        for val in self.values:
+            parts.append(f"{val:<{self.col_width(val)}}")
+        print("  " + "  ".join(parts), file=sys.stderr)
+        self._header_ncols = len(self.values)
+
+    def flush(self) -> None:
+        if not self.values:
+            self.bucket_start = time.monotonic()
+            return
+        if len(self.values) > self._header_ncols:
+            self._print_header()
+        max_cnt = max(self.current.values()) if self.current else 1
+        ts = datetime.now().strftime("%H:%M:%S")
+        parts = [f"{ts:<10}"]
+        for val in self.values:
+            cnt = self.current.get(val, 0)
+            bar = "█" * int(cnt / max_cnt * _BAR) if max_cnt > 0 else ""
+            cell = f"{bar} {cnt}" if cnt else ""
+            parts.append(f"{cell:<{self.col_width(val)}}")
+        print("  " + "  ".join(parts), file=sys.stderr, flush=True)
+        self.rows += 1
+        self.current = Counter()
+        self.bucket_start = time.monotonic()
+
+    def time_to_flush(self) -> float:
+        return max(0.0, self.interval - (time.monotonic() - self.bucket_start))
+
+
+def _feed_heatmap(heatmap: WatchHeatmap, trace: dict) -> None:
+    detail = trace.get("detail") or {}
+    for batch in detail.get("batches", []):
+        for scope_spans in batch.get("scopeSpans", []):
+            for span in scope_spans.get("spans", []):
+                for attr in span.get("attributes", []):
+                    if attr.get("key") != heatmap.key:
+                        continue
+                    v = attr.get("value", {})
+                    val = (
+                        v.get("stringValue")
+                        or (str(v["intValue"]) if "intValue" in v else "")
+                        or (str(v["boolValue"]).lower() if "boolValue" in v else "")
+                    )
+                    if val:
+                        heatmap.add(val)
+
+
+def run_stats(watch_key: str | None = None) -> None:
     stats = StreamStats()
+    heatmap = WatchHeatmap(watch_key) if watch_key else None
 
     def _print_and_exit(signum=None, frame=None) -> None:
+        print(file=sys.stderr)
+        if heatmap:
+            heatmap.flush()
         stats.print()
         sys.exit(0)
 
@@ -126,7 +207,21 @@ def run_stats() -> None:
     signal.signal(signal.SIGTERM, _print_and_exit)
 
     try:
-        for line in sys.stdin:
+        while True:
+            if heatmap:
+                timeout = heatmap.time_to_flush()
+                ready, _, _ = select.select([sys.stdin], [], [], timeout)
+                if not ready:
+                    heatmap.flush()
+                    continue
+                line = sys.stdin.readline()
+                if not line:
+                    break
+            else:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+
             line = line.strip()
             if not line:
                 continue
@@ -134,12 +229,18 @@ def run_stats() -> None:
                 trace = json.loads(line)
             except json.JSONDecodeError:
                 continue
+
             stats.ingest(trace)
-            print(f"\r{stats.traces} traces ingested...", end="", file=sys.stderr, flush=True)
+            if heatmap:
+                _feed_heatmap(heatmap, trace)
+            else:
+                print(f"\r{stats.traces} traces ingested...", end="", file=sys.stderr, flush=True)
     except (EOFError, BrokenPipeError):
         pass
 
-    print(file=sys.stderr)  # newline after the counter
+    print(file=sys.stderr)
+    if heatmap:
+        heatmap.flush()
     stats.print()
 
 
@@ -745,6 +846,7 @@ def main() -> None:
     )
 
     parser.add_argument("--stats", action="store_true", help="Read NDJSON from stdin and print live stream stats on EOF/Ctrl-C (pipe mode)")
+    parser.add_argument("--watch", metavar="KEY", help="With --stats: show live heatmap of a span attribute value over 10s buckets")
 
     src = parser.add_mutually_exclusive_group()
     src.add_argument("--file", "-f", metavar="FILE", help="NDJSON file (one-shot, re-parsed each query)")
@@ -767,7 +869,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.stats:
-        run_stats()
+        run_stats(watch_key=args.watch)
         return
 
     if args.import_file and not args.db:
