@@ -478,6 +478,46 @@ notrace tempo tail --lookback 90s   # if --duration-stats recommends 90s
 
 Typical workflow: `--import` → `--schema` to discover keys → `--duration-stats` to size your tail window → `--list-span-attr` to see values → filter with `--span-attr`/`--resource-attr` → `--span-tree` to inspect a trace → `--service-graph` to see call topology → `--time-series` to spot activity patterns over time.
 
+## ClickHouse mode
+
+When the lab stack is running, `query.py` can query ClickHouse directly instead of a file or DuckDB. All the same analysis commands work, backed by the `otel.otel_traces` table (7-day rolling retention, filled by the OTel Collector exporter).
+
+Requires `pip install clickhouse-connect`.
+
+```bash
+# explore attribute schema
+python3 lab/query.py --clickhouse localhost:8123 --schema
+```
+
+```
+ATTRIBUTE SCHEMA  (from otel.otel_traces — 1299 traces)
+
+SCOPE     KEY               TRACES  CARDINALITY  SAMPLE VALUES
+--------  ----------------  ------  -----------  ----------------------------------------
+span      http.method       1134    2            ['GET', 'POST']
+span      http.status_code  1134    2            ['200', '500']
+span      http.route        1134    7            ['/api/orders/{id}', '/api/products', ...]
+resource  service.name      1299    1            ['traffic-gen']
+```
+
+```bash
+# filter traces by span attributes (same syntax as --db / -f)
+python3 lab/query.py --clickhouse localhost:8123 --span-attr http.method=GET --span-attr http.status_code=200
+
+# root span duration percentiles
+python3 lab/query.py --clickhouse localhost:8123 --duration-stats
+
+# heatmap of attribute value distribution over time (10s buckets)
+python3 lab/query.py --clickhouse localhost:8123 --watch http.method
+
+# neighbour graph: which services co-occur with traces having this span attribute
+python3 lab/query.py --clickhouse localhost:8123 --watch http.status_code=500
+```
+
+The `--clickhouse` flag is mutually exclusive with `--file` / `--db`. When it is set, every command (`--schema`, `--list-span-attr`, `--list-resource-attr`, `--span-attr`, `--resource-attr`, `--duration-stats`, `--watch`) runs against ClickHouse instead of DuckDB or a file.
+
+`--watch` in ClickHouse mode loads all matching traces in one query and renders the heatmap immediately (no streaming), so it completes in seconds even over large datasets.
+
 ## Configuration
 
 Priority order: `--flag` > environment variable > config file.
