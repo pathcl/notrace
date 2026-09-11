@@ -51,11 +51,20 @@ Services once up:
 | Prometheus       | http://localhost:9090     | Metrics                                      |
 | Metrics          | http://localhost:8080     | traffic-gen Prometheus endpoint              |
 
-The traffic generator sends OTLP to the collector, which fans out to both stores:
+The traffic generator simulates a realistic multi-service deployment. Each logical service runs its own OTel SDK with a distinct `service.name` resource, so spans are exported in separate OTLP batches — the same shape as a real microservice system:
 
 ```
-traffic-gen → otel-collector → Tempo      (live tail, TraceQL, short-term)
-                             → ClickHouse  (analytical queries, 7-day retention)
+traffic-gen (6 services):
+  frontend  ──────────────────────────────────────────────────┐
+  checkout  ────────────────────────────────────────────┐     │
+  payment-svc, db, cache, background-worker  ───────┐   │     │
+                                                    ▼   ▼     ▼
+                                              otel-collector:4318
+                                                    │
+                                    ┌───────────────┴───────────────┐
+                                    ▼                               ▼
+                                  Tempo                        ClickHouse
+                           (live tail, TraceQL)          (analytics, 7-day TTL)
 ```
 
 Traces land in `otel.otel_traces` in ClickHouse automatically. Query them directly:
@@ -288,7 +297,7 @@ Final output:
 
 In practice, if all spans from a trace flow through the same OTel Collector pipeline (as in the lab), every `parentSpanId` is resolvable and edges are complete. In a setup where services export independently and spans arrive in separate sessions, co-occurring services remain accurate but direct edges may be partial.
 
-Direct edges require each service to emit its own OTLP resource batch. Co-occurring services work regardless of how spans are grouped in the export.
+**Direct edges require each service to emit its own OTLP resource batch with a distinct `service.name`.** The edge filter is `parent.service_name != child.service_name` — if both spans share the same resource `service.name`, the edge is dropped even if they have different `component` span attributes. The lab traffic generator emits one TracerProvider per logical service (`frontend`, `checkout`, `payment-svc`, `db`, `cache`, `background-worker`) so each service's spans land in a separate OTLP batch with the correct `service.name`. Co-occurring services work regardless of how spans are grouped in the export.
 
 If you're not sure which attribute keys are available, let `--stats` run for a minute — the "top span attributes" block tells you what's flowing through.
 
