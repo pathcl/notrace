@@ -197,6 +197,21 @@ New columns appear automatically as new attribute values are seen. On Ctrl-C the
 
 If you're not sure which attribute keys are available, let `--stats` run for a minute — the "top span attributes" block tells you what's flowing through.
 
+`--stats` and `--watch` also work on a captured file — pipe it the same way:
+
+```bash
+# summary stats from a captured file
+cat notrace.json | python3 lab/query.py --stats
+
+# heatmap from a captured file
+cat notrace.json | python3 lab/query.py --stats --watch component
+
+# one-shot search piped directly
+./notrace tempo search --start 1h -o json --details | python3 lab/query.py --stats --watch http.route
+```
+
+When reading from a file all traces land in a single bucket (disk reads at full speed), so the heatmap shows one aggregated row rather than a time series — but the summary stats and relative column sizes are still accurate.
+
 ## Offline analysis
 
 Capture traces to a file and query them with `lab/query.py`, a DuckDB-backed helper that filters by span and resource attributes.
