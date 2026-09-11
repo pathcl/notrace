@@ -408,6 +408,9 @@ python3 lab/query.py --db notrace.db --trace-id 38f26ee12443bc2ef4ccb638808bb449
 ```bash
 # cross-service call graph (caller → callee, per operation)
 python3 lab/query.py --db notrace.db --service-graph
+
+# same, directly from ClickHouse (no import needed)
+python3 lab/query.py --clickhouse localhost:8123 --service-graph
 ```
 
 ```
@@ -506,6 +509,9 @@ python3 lab/query.py --clickhouse localhost:8123 --span-attr http.method=GET --s
 
 # root span duration percentiles
 python3 lab/query.py --clickhouse localhost:8123 --duration-stats
+
+# cross-service call graph (caller → callee, derived from parentSpanId)
+python3 lab/query.py --clickhouse localhost:8123 --service-graph
 
 # heatmap of attribute value distribution over time (10s buckets)
 python3 lab/query.py --clickhouse localhost:8123 --watch http.method
