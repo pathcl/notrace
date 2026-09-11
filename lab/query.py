@@ -50,15 +50,15 @@ class StreamStats:
     def ingest(self, trace: dict) -> None:
         self.traces += 1
         detail = trace.get("detail") or {}
-        for batch in detail.get("batches", []):
+        for batch in detail.get("batches") or []:
             resource_attrs = {
                 a["key"]: a.get("value", {})
-                for a in batch.get("resource", {}).get("attributes", [])
+                for a in batch.get("resource", {}).get("attributes") or []
             }
             svc = resource_attrs.get("service.name", {}).get("stringValue", "")
 
-            for scope_spans in batch.get("scopeSpans", []):
-                for span in scope_spans.get("spans", []):
+            for scope_spans in batch.get("scopeSpans") or []:
+                for span in scope_spans.get("spans") or []:
                     parent = span.get("parentSpanId", "")
                     dur_ns = int(span.get("endTimeUnixNano", 0)) - int(span.get("startTimeUnixNano", 0))
                     if not parent:
@@ -66,7 +66,7 @@ class StreamStats:
                         if svc:
                             self.services[svc] += 1
 
-                    for attr in span.get("attributes", []):
+                    for attr in span.get("attributes") or []:
                         key = attr.get("key", "")
                         if key:
                             self.span_attrs[key] += 1
@@ -176,10 +176,10 @@ class WatchHeatmap:
 
 def _feed_heatmap(heatmap: WatchHeatmap, trace: dict) -> None:
     detail = trace.get("detail") or {}
-    for batch in detail.get("batches", []):
-        for scope_spans in batch.get("scopeSpans", []):
-            for span in scope_spans.get("spans", []):
-                for attr in span.get("attributes", []):
+    for batch in detail.get("batches") or []:
+        for scope_spans in batch.get("scopeSpans") or []:
+            for span in scope_spans.get("spans") or []:
+                for attr in span.get("attributes") or []:
                     if attr.get("key") != heatmap.key:
                         continue
                     v = attr.get("value", {})
@@ -402,14 +402,14 @@ def import_ndjson(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
             if detail:
                 attr_rows = []
                 span_rows = []
-                for batch in detail.get("batches", []):
-                    for attr in batch.get("resource", {}).get("attributes", []):
+                for batch in detail.get("batches") or []:
+                    for attr in batch.get("resource", {}).get("attributes") or []:
                         key, str_val, int_val, bool_val = _extract_attr(attr)
                         attr_rows.append((trace_id, None, "resource", key, str_val, int_val, bool_val))
 
-                    for scope_span in batch.get("scopeSpans", []):
+                    for scope_span in batch.get("scopeSpans") or []:
                         svc = scope_span.get("scope", {}).get("name", "")
-                        for span in scope_span.get("spans", []):
+                        for span in scope_span.get("spans") or []:
                             span_name = span.get("name", "")
                             span_id = span.get("spanId", "")
                             parent_id = span.get("parentSpanId", "")
@@ -423,7 +423,7 @@ def import_ndjson(con: duckdb.DuckDBPyConnection, file_path: str) -> None:
                                 start_ns = 0
                                 duration_ns = 0
 
-                            for attr in span.get("attributes", []):
+                            for attr in span.get("attributes") or []:
                                 if attr.get("key") == "component":
                                     component = attr.get("value", {}).get("stringValue")
                                 key, str_val, int_val, bool_val = _extract_attr(attr)
