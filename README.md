@@ -177,7 +177,7 @@ LIVE STREAM STATS  (48 traces, 9s)
 
 **Live heatmap — `--watch KEY`**
 
-Add `--watch KEY` to see a scrolling heatmap of a span attribute's values over 10-second buckets. Each column is a unique value; bar width is proportional to the busiest value in that bucket.
+Add `--watch KEY` to see a heatmap of a span attribute's values bucketed by the span's actual `startTimeUnixNano`. Each column is a unique value; bar width is proportional to the busiest bucket. Rows print on EOF or Ctrl-C sorted by real trace time — accurate for both live tail and offline file analysis.
 
 ```bash
 # which downstream services are being called, and how often
@@ -186,20 +186,22 @@ Add `--watch KEY` to see a scrolling heatmap of a span attribute's values over 1
 # HTTP route activity over time
 ./notrace tempo tail -o json --details | python3 lab/query.py --stats --watch http.route
 
-# error vs success ratio live
-./notrace tempo tail -o json --details | python3 lab/query.py --stats --watch http.status_code
+# works the same on a captured file — timestamps reflect when traces actually happened
+cat notrace.json | python3 lab/query.py --stats --watch http.method
 ```
 
 ```
-component  (live, 10s buckets)
+http.method  (10s buckets)
 
-              db            payment-svc   cache
-  09:07:14    ████████ 49   █ 11          ████ 27
-  09:07:24    ████████ 24   ██ 6          ████ 12
-  09:07:34    ████████ 28   █ 6           ████ 16
+                       POST          GET
+  2026-09-11 08:42:00  ████ 1
+  2026-09-11 08:42:10  ████ 1        ████ 1
+  2026-09-11 08:42:20  ████████ 2
+  2026-09-11 08:42:30                ████ 1
+  2026-09-11 08:42:40  ████ 1        ████████ 2
 ```
 
-New columns appear automatically as new attribute values are seen. On Ctrl-C the full `--stats` summary prints below the heatmap.
+New columns appear automatically as new attribute values are seen. The full `--stats` summary prints below the heatmap.
 
 **Neighbour graph — `--watch KEY=VALUE`**
 
