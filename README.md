@@ -132,19 +132,25 @@ notrace tempo tail -o json --details >> notrace.json
 notrace tempo tail --limit 500 -v
 ```
 
+> **Note**: without `--details`, output contains only search metadata (traceID, service name, duration). Span and resource attributes are **not** included. If you plan to analyse the output with `query.py`, you must pass `--details`.
+
 ## Offline analysis
 
 Capture traces to a file and query them with `lab/query.py`, a DuckDB-backed helper that filters by span and resource attributes.
 
 **Capture:**
 
+> **`--details` is required.** Without it, the output contains no span or resource attributes and `query.py` will exit with an error.
+
 ```bash
+# continuous capture (append as new traces arrive)
 ./notrace tempo tail -o json --details >> notrace.json
-# or a one-shot search
+
+# one-shot over a time range
 ./notrace tempo search --start 1h -o json --details > notrace.json
 ```
 
-Requires `pip install duckdb`. The `--details` flag must be used when capturing, otherwise span and resource attributes are not included in the output.
+Requires `pip install duckdb`.
 
 ### File mode (one-shot)
 
