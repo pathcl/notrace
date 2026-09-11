@@ -1086,6 +1086,32 @@ ORDER BY bucket, val
     heatmap.flush()
 
 
+def service_graph_ch(ch) -> None:
+    """Print cross-service call edges from ClickHouse using parentSpanId joins."""
+    sql = f"""
+SELECT
+    p.ServiceName                                                     AS caller,
+    coalesce(nullIf(c.SpanAttributes['component'], ''), c.ServiceName) AS callee,
+    c.SpanName                                                        AS operation,
+    count()                                                           AS calls,
+    round(avg(c.Duration) / 1e6, 2)                                   AS avg_ms,
+    round(max(c.Duration) / 1e6, 2)                                   AS max_ms
+FROM {_CH_TABLE} c
+JOIN {_CH_TABLE} p
+  ON c.TraceId = p.TraceId
+ AND c.ParentSpanId = p.SpanId
+WHERE c.ParentSpanId != ''
+  AND coalesce(nullIf(c.SpanAttributes['component'], ''), c.ServiceName) != p.ServiceName
+GROUP BY caller, callee, operation
+ORDER BY calls DESC
+"""
+    rows = ch.query(sql).result_rows
+    if not rows:
+        print("no cross-service calls found", file=sys.stderr)
+        return
+    print_table(rows, ["caller", "callee", "operation", "calls", "avg_ms", "max_ms"])
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1133,6 +1159,8 @@ def main() -> None:
 
         if args.schema:
             schema_ch(ch)
+        elif args.service_graph:
+            service_graph_ch(ch)
         elif args.list_span_attr:
             list_ch(ch, args.list_span_attr, "span", with_sample=args.detail)
         elif args.list_resource_attr:
@@ -1151,8 +1179,8 @@ def main() -> None:
     if args.schema and not args.db:
         print("error: --schema requires --db", file=sys.stderr)
         sys.exit(1)
-    if args.service_graph and not args.db:
-        print("error: --service-graph requires --db", file=sys.stderr)
+    if args.service_graph and not args.db and not args.clickhouse:
+        print("error: --service-graph requires --db or --clickhouse", file=sys.stderr)
         sys.exit(1)
     if args.span_tree and not args.db:
         print("error: --span-tree requires --db", file=sys.stderr)
