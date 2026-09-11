@@ -933,6 +933,160 @@ WHERE 1=1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ClickHouse mode  (--clickhouse host:port)
+# ──────────────────────────────────────────────────────────────────────────────
+
+try:
+    import clickhouse_connect
+    _CH_AVAILABLE = True
+except ImportError:
+    _CH_AVAILABLE = False
+
+_CH_DB = "otel"
+_CH_TABLE = "otel_traces"
+
+
+def _ch_client(dsn: str):
+    if not _CH_AVAILABLE:
+        print("error: clickhouse-connect not installed — run: pip install clickhouse-connect", file=sys.stderr)
+        sys.exit(1)
+    host, _, port_str = dsn.partition(":")
+    port = int(port_str) if port_str else 8123
+    return clickhouse_connect.get_client(host=host, port=port, database=_CH_DB)
+
+
+def schema_ch(ch) -> None:
+    sql = f"""
+SELECT scope, key,
+       countDistinct(trace_id) AS traces,
+       countDistinct(val)      AS cardinality,
+       groupArray(5)(val)      AS samples
+FROM (
+    SELECT 'span'     AS scope, arrayJoin(mapKeys(SpanAttributes))     AS key,
+           SpanAttributes[key] AS val, TraceId AS trace_id
+    FROM {_CH_TABLE} WHERE val != ''
+    UNION ALL
+    SELECT 'resource' AS scope, arrayJoin(mapKeys(ResourceAttributes)) AS key,
+           ResourceAttributes[key] AS val, TraceId AS trace_id
+    FROM {_CH_TABLE} WHERE val != ''
+)
+GROUP BY scope, key
+ORDER BY scope DESC, traces DESC
+"""
+    total = ch.command(f"SELECT countDistinct(TraceId) FROM {_CH_TABLE}")
+    rows = ch.query(sql).result_rows
+    if not rows:
+        print("no attributes found", file=sys.stderr)
+        return
+    print(f"ATTRIBUTE SCHEMA  (from {_CH_DB}.{_CH_TABLE} — {total} traces)\n")
+    print_table(rows, ["scope", "key", "traces", "cardinality", "sample values"])
+
+
+def list_ch(ch, key: str, scope: str, with_sample: bool = False) -> None:
+    attr_map = "SpanAttributes" if scope == "span" else "ResourceAttributes"
+    if with_sample:
+        sql = (f"SELECT {attr_map}['{key}'] AS val, any(TraceId) AS sample "
+               f"FROM {_CH_TABLE} WHERE val != '' GROUP BY val ORDER BY val")
+    else:
+        sql = (f"SELECT DISTINCT {attr_map}['{key}'] AS val "
+               f"FROM {_CH_TABLE} WHERE val != '' ORDER BY val")
+    rows = ch.query(sql).result_rows
+    if not rows:
+        print(f"no values found for {scope} attribute {key!r}", file=sys.stderr)
+        return
+    for row in rows:
+        print("  ".join(str(c) for c in row))
+
+
+def query_ch(ch, span_attrs: list[tuple[str, str]], resource_attrs: list[tuple[str, str]]) -> None:
+    wheres = ["ParentSpanId = ''"]
+    for key, val in span_attrs:
+        wheres.append(f"SpanAttributes['{key}'] = '{val}'")
+    for key, val in resource_attrs:
+        wheres.append(f"ResourceAttributes['{key}'] = '{val}'")
+    where_clause = " AND ".join(wheres)
+    sql = f"""
+SELECT TraceId, ServiceName, SpanName,
+       round(Duration / 1e6, 2) AS duration_ms,
+       Timestamp
+FROM {_CH_TABLE}
+WHERE {where_clause}
+ORDER BY Duration DESC
+LIMIT 50
+"""
+    rows = ch.query(sql).result_rows
+    if not rows:
+        print("no traces matched", file=sys.stderr)
+        return
+    print_table(rows, ["trace_id", "service", "root_span", "duration_ms", "started"])
+
+
+def stats_ch(ch, watch_key: str | None = None) -> None:
+    """Print duration stats + optional heatmap directly from ClickHouse aggregations."""
+    # Duration stats (root spans = ParentSpanId empty)
+    row = ch.query(f"""
+SELECT count()                                AS root_spans,
+       min(Duration) / 1e6                   AS min_ms,
+       avg(Duration) / 1e6                   AS avg_ms,
+       max(Duration) / 1e6                   AS max_ms,
+       quantile(0.50)(Duration) / 1e6        AS p50_ms,
+       quantile(0.95)(Duration) / 1e6        AS p95_ms,
+       quantile(0.99)(Duration) / 1e6        AS p99_ms
+FROM {_CH_TABLE}
+WHERE ParentSpanId = ''
+""").result_rows
+    if row:
+        print_duration_stats(row[0])
+
+    if not watch_key:
+        return
+
+    # Heatmap: bucket by real span time
+    filter_val = None
+    key = watch_key
+    if "=" in watch_key:
+        key, _, filter_val = watch_key.partition("=")
+
+    if filter_val is None:
+        # key-only: columns = unique values of SpanAttributes[key] per bucket
+        sql = f"""
+SELECT toStartOfInterval(Timestamp, INTERVAL 10 SECOND) AS bucket,
+       SpanAttributes['{key}']                          AS val,
+       count()                                          AS cnt
+FROM {_CH_TABLE}
+WHERE val != ''
+GROUP BY bucket, val
+ORDER BY bucket, val
+"""
+    else:
+        # key=value: columns = co-occurring ServiceName in matching traces
+        sql = f"""
+SELECT toStartOfInterval(Timestamp, INTERVAL 10 SECOND) AS bucket,
+       ServiceName                                      AS val,
+       countDistinct(TraceId)                           AS cnt
+FROM {_CH_TABLE}
+WHERE TraceId IN (
+    SELECT DISTINCT TraceId FROM {_CH_TABLE}
+    WHERE SpanAttributes['{key}'] = '{filter_val}'
+)
+GROUP BY bucket, val
+ORDER BY bucket, val
+"""
+    rows = ch.query(sql).result_rows
+    if not rows:
+        print(f"no data for {watch_key!r}", file=sys.stderr)
+        return
+
+    # Feed into WatchHeatmap using span timestamps
+    heatmap = WatchHeatmap(key, filter_val=filter_val)
+    for bucket_ts, val, cnt in rows:
+        ts_ns = int(bucket_ts.timestamp() * 1e9)
+        for _ in range(cnt):
+            heatmap.add(val, ts_ns)
+    heatmap.flush()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -949,6 +1103,7 @@ def main() -> None:
     src = parser.add_mutually_exclusive_group()
     src.add_argument("--file", "-f", metavar="FILE", help="NDJSON file (one-shot, re-parsed each query)")
     src.add_argument("--db", metavar="PATH", help="DuckDB database file (persistent, indexed)")
+    src.add_argument("--clickhouse", metavar="HOST:PORT", help="ClickHouse server (e.g. localhost:8123) — queries otel.otel_traces directly")
 
     parser.add_argument("--import", dest="import_file", metavar="FILE", help="Import NDJSON into --db, skipping duplicates (requires --db)")
     parser.add_argument("--schema", action="store_true", help="Print attribute cardinality report (requires --db)")
@@ -970,6 +1125,26 @@ def main() -> None:
         run_stats(watch_key=args.watch)
         return
 
+    # ── ClickHouse mode ────────────────────────────────────────────────────────
+    if args.clickhouse:
+        ch = _ch_client(args.clickhouse)
+        span_attrs   = parse_kv(args.span_attr)
+        resource_attrs = parse_kv(args.resource_attr)
+
+        if args.schema:
+            schema_ch(ch)
+        elif args.list_span_attr:
+            list_ch(ch, args.list_span_attr, "span", with_sample=args.detail)
+        elif args.list_resource_attr:
+            list_ch(ch, args.list_resource_attr, "resource", with_sample=args.detail)
+        elif args.duration_stats or args.watch:
+            stats_ch(ch, watch_key=args.watch)
+        elif span_attrs or resource_attrs:
+            query_ch(ch, span_attrs, resource_attrs)
+        else:
+            stats_ch(ch)
+        return
+
     if args.import_file and not args.db:
         print("error: --import requires --db", file=sys.stderr)
         sys.exit(1)
@@ -988,8 +1163,8 @@ def main() -> None:
     if args.duration_stats and not args.db:
         print("error: --duration-stats requires --db", file=sys.stderr)
         sys.exit(1)
-    if not args.file and not args.db:
-        print("error: one of --file or --db is required", file=sys.stderr)
+    if not args.file and not args.db and not args.clickhouse:
+        print("error: one of --file, --db, or --clickhouse is required", file=sys.stderr)
         sys.exit(1)
 
     con = duckdb.connect(args.db or ":memory:")
