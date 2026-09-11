@@ -251,6 +251,43 @@ NEIGHBOURS for http.status_code=500  (12/48 traces matched)
     payment-svc    4
 ```
 
+**How edge resolution works**
+
+For each span where `KEY=VALUE` matches, the feature walks `parentSpanId` inside the same stream to find the parent span and records a directed edge between the two services. Both the child and parent span must be present in the stream for an edge to resolve — if the parent span never arrived (different session, service not exporting), the edge is dropped but the service still appears in co-occurring counts.
+
+```
+Stream of NDJSON spans (from tail or file)
+
+  Trace A
+  ┌─────────────────────────────────────────────────────┐
+  │  span-1  service=frontend   parentSpanId=""         │  ← root
+  │  span-2  service=checkout   parentSpanId=span-1     │
+  │  span-3  service=payment    parentSpanId=span-2     │
+  │  span-4  service=payment    parentSpanId=span-2     │  http.status_code=500 ✓ MATCH
+  └─────────────────────────────────────────────────────┘
+
+  span-4 → parent span-2 (checkout) → parent span-1 (frontend)
+  edges recorded:  checkout → payment,  frontend → checkout
+
+  Trace B  (parent span NOT in stream)
+  ┌─────────────────────────────────────────────────────┐
+  │  span-9  service=checkout   parentSpanId=span-X     │  span-X never arrived
+  │                                                     │  http.status_code=500 ✓ MATCH
+  └─────────────────────────────────────────────────────┘
+
+  span-9 → parent span-X → NOT FOUND → edge dropped
+  checkout still recorded as a co-occurring service
+
+Final output:
+  direct edges:           frontend → checkout  1
+                          checkout → payment   1
+  co-occurring services:  frontend  1
+                          checkout  2   (Trace A + Trace B)
+                          payment   1
+```
+
+In practice, if all spans from a trace flow through the same OTel Collector pipeline (as in the lab), every `parentSpanId` is resolvable and edges are complete. In a setup where services export independently and spans arrive in separate sessions, co-occurring services remain accurate but direct edges may be partial.
+
 Direct edges require each service to emit its own OTLP resource batch. Co-occurring services work regardless of how spans are grouped in the export.
 
 If you're not sure which attribute keys are available, let `--stats` run for a minute — the "top span attributes" block tells you what's flowing through.
