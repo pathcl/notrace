@@ -120,6 +120,7 @@ If `--details` is set, each new trace triggers a second call to `GET /api/traces
 |------|-------|---------|-------------|
 | `--query` | `-q` | `{}` | TraceQL expression |
 | `--interval` | | `5s` | Poll interval |
+| `--lookback` | | `30s` | Sliding window size — increase if p99 trace duration exceeds the default |
 | `--limit` | | `100` | Max traces fetched per poll |
 | `--output` | `-o` | `table` | Output format: `table`, `json` |
 | `--details` | `-d` | `false` | Fetch and display resource + span attributes per trace |
@@ -129,10 +130,13 @@ notrace tempo tail
 notrace tempo tail -q '{resource.service.name="frontend"}' --interval 3s
 notrace tempo tail -q '{status=error}' -o json | jq .rootTraceName
 notrace tempo tail -o json --details >> notrace.json
+notrace tempo tail --lookback 60s -o json --details | python3 lab/query.py --stats
 notrace tempo tail --limit 500 -v
 ```
 
 > **Note**: without `--details`, output contains only search metadata (traceID, service name, duration). Span and resource attributes are **not** included. If you plan to analyse the output with `query.py`, you must pass `--details`.
+
+> **Sizing `--lookback`**: if your p99 root span duration exceeds 30s, traces that are still in-flight when the window slides past their start time will be missed. Use `--duration-stats` to measure your p99 and set `--lookback` accordingly — the recommended value is printed automatically.
 
 ## Live pipe analysis
 
